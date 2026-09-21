@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from eval.metrics import compute_metrics
+from eval.metrics import compute_metrics, frame_for
 
 DEFAULT_TOLERANCES = {
     "roc_auc": 0.02,  # absolute drop allowed
@@ -68,20 +68,19 @@ def main() -> None:
     ap.add_argument("--candidate", type=Path, required=True)
     ap.add_argument("--t-low", type=float, default=0.2)
     ap.add_argument("--t-high", type=float, default=0.8)
-    ap.add_argument("--c-min", type=float, default=0.6)
     ap.add_argument("--tolerances", type=str, default=None, help="JSON overrides")
     args = ap.parse_args()
 
     tol = {**DEFAULT_TOLERANCES, **(json.loads(args.tolerances) if args.tolerances else {})}
-    base_df = pd.read_parquet(args.baseline)
-    cand_df = pd.read_parquet(args.candidate)
+    base_df = frame_for(pd.read_parquet(args.baseline), "test")
+    cand_df = frame_for(pd.read_parquet(args.candidate), "test")
     # Compare on the intersection of transaction ids so the sample is identical.
     ids = set(base_df["transaction_id"]) & set(cand_df["transaction_id"])
     base_df = base_df[base_df["transaction_id"].isin(ids)]
     cand_df = cand_df[cand_df["transaction_id"].isin(ids)]
 
-    base = flatten(compute_metrics(base_df, args.t_low, args.t_high, args.c_min))
-    cand = flatten(compute_metrics(cand_df, args.t_low, args.t_high, args.c_min))
+    base = flatten(compute_metrics(base_df, args.t_low, args.t_high))
+    cand = flatten(compute_metrics(cand_df, args.t_low, args.t_high))
     rows, ok = compare(base, cand, tol)
 
     print(f"compared {len(ids)} shared transactions")

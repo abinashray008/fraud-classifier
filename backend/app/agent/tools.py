@@ -19,7 +19,8 @@ def build_tools(store: FeatureStore) -> list[BaseTool]:
     @tool
     def get_device_history(device_info: str) -> str:
         """Return how many distinct cards a device fingerprint has been seen with and
-        how many chargebacks are associated with it."""
+        how many chargebacks are associated with it. Generic descriptions such as
+        Windows are not fingerprints; those lookups come back unknown."""
         return json.dumps(store.device_history(device_info))
 
     @tool

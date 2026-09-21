@@ -12,21 +12,39 @@ export interface TransactionInput {
   recipient_email_domain?: string
   billing_region?: string
   billing_country?: string
-  distance_billing_to_purchase?: number
+  dist1?: number
   timestamp_delta_seconds?: number
   device_type?: string
   device_info?: string
-  card_txn_count?: number
-  addr_match_count?: number
-  email_txn_count?: number
-  device_txn_count?: number
-  days_since_prev_txn?: number
-  days_since_card_first_seen?: number
-  days_since_prev_txn_same_addr?: number
-  days_since_prev_txn_same_amount?: number
-  days_since_device_first_seen?: number
+  /** Opaque IEEE-CIS count/timedelta columns; accepted but not interpreted. */
+  c1?: number
+  c2?: number
+  c13?: number
+  c14?: number
+  d1?: number
+  d2?: number
+  d4?: number
+  d10?: number
+  d15?: number
   card_avg_amount?: number
   card_known_devices?: string[]
+  /** In-person authorization routed through the card network. */
+  channel?: 'card_present' | 'card_not_present'
+  entry_mode?: 'swipe' | 'chip' | 'contactless' | 'fallback_swipe' | 'keyed'
+  card_status?: 'open' | 'lost' | 'stolen' | 'expired' | 'blocked'
+  cvm_result?: 'pin_verified' | 'pin_failed' | 'signature' | 'no_cvm'
+  pin_tries_exceeded?: boolean
+  track_cvv?: 'match' | 'mismatch' | 'not_present'
+  merchant_id?: string
+  merchant_name?: string
+  mcc?: string
+  merchant_country?: string
+  merchant_city?: string
+  terminal_id?: string
+  terminal_attended?: boolean
+  cardholder_country?: string
+  available_credit_usd?: number
+  single_purchase_limit_usd?: number
 }
 
 export interface NoulResult {
@@ -63,9 +81,11 @@ export interface PolicyExplanation {
   rule: string
   t_low: number
   t_high: number
-  c_min: number
   fraud_probability: number
+  risk_score: number
+  /** Concentration of the risk-level distribution. Not P(the fraud answer is correct). */
   risk_confidence: number
+  review_reason: 'contradictory' | 'insufficient_evidence' | 'ambiguous' | null
 }
 
 export interface Verdict {
@@ -131,5 +151,5 @@ export interface Health {
   jev_configured: boolean
   agent_configured: boolean
   otp_dev_mode: boolean
-  policy: { t_low: number; t_high: number; c_min: number }
+  policy: { t_low: number; t_high: number; evidence_min: number }
 }

@@ -10,34 +10,41 @@ interface Props {
 type Field = {
   key: keyof TransactionInput
   label: string
-  type: 'text' | 'number'
-  group: 'transaction' | 'device' | 'velocity'
+  type: 'text' | 'number' | 'boolean'
+  group: 'transaction' | 'device' | 'card present'
 }
 
 const FIELDS: Field[] = [
   { key: 'card_id', label: 'Card id (feature-store key)', type: 'text', group: 'transaction' },
   { key: 'amount', label: 'Amount (USD)', type: 'number', group: 'transaction' },
-  { key: 'product_code', label: 'Product code (W/C/H/S/R)', type: 'text', group: 'transaction' },
   { key: 'card_network', label: 'Card network', type: 'text', group: 'transaction' },
   { key: 'card_type', label: 'Card type (debit/credit)', type: 'text', group: 'transaction' },
   { key: 'purchaser_email_domain', label: 'Purchaser email domain', type: 'text', group: 'transaction' },
   { key: 'recipient_email_domain', label: 'Recipient email domain', type: 'text', group: 'transaction' },
-  { key: 'billing_region', label: 'Billing region code', type: 'text', group: 'transaction' },
-  { key: 'distance_billing_to_purchase', label: 'Distance billing to purchase', type: 'number', group: 'transaction' },
-  { key: 'timestamp_delta_seconds', label: 'Timestamp offset (s)', type: 'number', group: 'transaction' },
+  { key: 'billing_region', label: 'addr1 (address code)', type: 'text', group: 'transaction' },
+  { key: 'dist1', label: 'dist1 (distance; unit unpublished)', type: 'number', group: 'transaction' },
+  { key: 'timestamp_delta_seconds', label: 'TransactionDT (s since reference)', type: 'number', group: 'transaction' },
   { key: 'device_type', label: 'Device type', type: 'text', group: 'device' },
   { key: 'device_info', label: 'Device info', type: 'text', group: 'device' },
-  { key: 'device_txn_count', label: 'Txns from device', type: 'number', group: 'device' },
-  { key: 'days_since_device_first_seen', label: 'Days since device first seen', type: 'number', group: 'device' },
-  { key: 'card_txn_count', label: 'Card txn count', type: 'number', group: 'velocity' },
-  { key: 'email_txn_count', label: 'Email txn count', type: 'number', group: 'velocity' },
-  { key: 'days_since_prev_txn', label: 'Days since previous txn', type: 'number', group: 'velocity' },
-  { key: 'days_since_card_first_seen', label: 'Days since card first seen', type: 'number', group: 'velocity' },
-  { key: 'days_since_prev_txn_same_amount', label: 'Days since same amount', type: 'number', group: 'velocity' },
-  { key: 'card_avg_amount', label: 'Card average amount', type: 'number', group: 'velocity' },
+  { key: 'amount', label: 'Authorization amount (USD)', type: 'number', group: 'card present' },
+  { key: 'channel', label: 'Channel (card_present)', type: 'text', group: 'card present' },
+  { key: 'entry_mode', label: 'Entry mode (swipe/chip/contactless/fallback_swipe)', type: 'text', group: 'card present' },
+  { key: 'card_status', label: 'Card status (open/lost/stolen/expired/blocked)', type: 'text', group: 'card present' },
+  { key: 'cvm_result', label: 'CVM (pin_verified/pin_failed/signature/no_cvm)', type: 'text', group: 'card present' },
+  { key: 'track_cvv', label: 'Track CVV (match/mismatch/not_present)', type: 'text', group: 'card present' },
+  { key: 'pin_tries_exceeded', label: 'PIN tries exceeded', type: 'boolean', group: 'card present' },
+  { key: 'merchant_id', label: 'Merchant id', type: 'text', group: 'card present' },
+  { key: 'merchant_name', label: 'Merchant name', type: 'text', group: 'card present' },
+  { key: 'mcc', label: 'MCC', type: 'text', group: 'card present' },
+  { key: 'merchant_country', label: 'Merchant country', type: 'text', group: 'card present' },
+  { key: 'merchant_city', label: 'Merchant city', type: 'text', group: 'card present' },
+  { key: 'cardholder_country', label: 'Cardholder country', type: 'text', group: 'card present' },
+  { key: 'terminal_attended', label: 'Terminal attended', type: 'boolean', group: 'card present' },
+  { key: 'available_credit_usd', label: 'Available credit (USD)', type: 'number', group: 'card present' },
+  { key: 'single_purchase_limit_usd', label: 'Single-purchase limit (USD)', type: 'number', group: 'card present' },
 ]
 
-const GROUPS: Array<Field['group']> = ['transaction', 'device', 'velocity']
+const GROUPS: Array<Field['group']> = ['transaction', 'device', 'card present']
 
 export function Simulator({ onSubmit, busy }: Props) {
   const [tx, setTx] = useState<TransactionInput>(PRESETS[0].tx)
@@ -60,6 +67,8 @@ export function Simulator({ onSubmit, busy }: Props) {
       } else if (type === 'number') {
         const n = Number(raw)
         if (!Number.isNaN(n)) (next as Record<string, unknown>)[key] = n
+      } else if (type === 'boolean') {
+        ;(next as Record<string, unknown>)[key] = raw === 'true'
       } else {
         ;(next as Record<string, unknown>)[key] = raw
       }
@@ -111,12 +120,23 @@ export function Simulator({ onSubmit, busy }: Props) {
               {FIELDS.filter((f) => f.group === g).map((f) => (
                 <label key={f.key}>
                   <span>{f.label}</span>
-                  <input
-                    type={f.type}
-                    step="any"
-                    value={(tx[f.key] as string | number | undefined) ?? ''}
-                    onChange={(e) => update(f.key, e.target.value, f.type)}
-                  />
+                  {f.type === 'boolean' ? (
+                    <select
+                      value={tx[f.key] === true ? 'true' : tx[f.key] === false ? 'false' : ''}
+                      onChange={(e) => update(f.key, e.target.value, f.type)}
+                    >
+                      <option value="">—</option>
+                      <option value="true">true</option>
+                      <option value="false">false</option>
+                    </select>
+                  ) : (
+                    <input
+                      type={f.type}
+                      step="any"
+                      value={(tx[f.key] as string | number | undefined) ?? ''}
+                      onChange={(e) => update(f.key, e.target.value, f.type)}
+                    />
+                  )}
                 </label>
               ))}
             </div>

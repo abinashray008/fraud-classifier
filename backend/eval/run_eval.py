@@ -23,10 +23,26 @@ from app.features.state_builder import build_state
 from app.jev.classifier import JevFraudClassifier
 from app.jev.questions import SIGNAL_QUESTIONS
 from app.schemas.transaction import JevAnswers
-from eval.load_ieee import row_to_transaction
+from eval.load_ieee import row_history, row_to_transaction
 
 
-def answers_to_row(tx_id: str, label: int, a: JevAnswers) -> dict:
+def _cell(row: pd.Series, key: str):
+    if key not in row.index:
+        return None
+    value = row[key]
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    return value
+
+
+def answers_to_row(
+    tx_id: str,
+    label: int,
+    a: JevAnswers,
+    *,
+    split: str | None = None,
+    sample_weight: float | None = None,
+) -> dict:
     row = {
         "transaction_id": tx_id,
         "label": label,
@@ -44,6 +60,10 @@ def answers_to_row(tx_id: str, label: int, a: JevAnswers) -> dict:
     }
     for q in SIGNAL_QUESTIONS:
         row[f"signal_{q}"] = a.signals[q].noul if q in a.signals else None
+    if split is not None:
+        row["split"] = split
+    if sample_weight is not None:
+        row["sample_weight"] = sample_weight
     return row
 
 
@@ -66,7 +86,7 @@ async def score_sample(
     async def one(row: pd.Series) -> None:
         nonlocal errors
         tx = row_to_transaction(row)
-        state = build_state(tx)
+        state = build_state(tx, history=row_history(row))
         async with sem:
             try:
                 answers = await classifier.classify(state)
@@ -74,7 +94,17 @@ async def score_sample(
                 errors += 1
                 print(f"  ! {tx.transaction_id}: {type(exc).__name__}: {exc}")
                 return
-        rows.append(answers_to_row(tx.transaction_id or "", int(row["isFraud"]), answers))
+        split = _cell(row, "split")
+        weight = _cell(row, "sample_weight")
+        rows.append(
+            answers_to_row(
+                tx.transaction_id or "",
+                int(row["isFraud"]),
+                answers,
+                split=None if split is None else str(split),
+                sample_weight=None if weight is None else float(weight),
+            )
+        )
         if len(rows) % 100 == 0:
             print(f"  scored {len(rows)}/{len(todo)}")
 

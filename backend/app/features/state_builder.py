@@ -1,18 +1,69 @@
-"""Build the Jev `state` from a Transaction.
+"""Build the Jev `state` from a Transaction plus optional card history.
 
-Jev is a semantic classifier: it reasons over readable fields, not opaque
-columns. This module trims the transaction to decision-relevant fields, renames
-them descriptively, and adds derived features (hour of day, amount anomaly,
-email domain class, distance bucket, velocity flags). Irrelevant context degrades
-accuracy and costs tokens, so `None` values are dropped.
+Jev is a semantic classifier: it reasons over readable fields. Invented labels
+for masked IEEE-CIS columns (C14 as "device transaction count", D15 as
+"device age", ProductCD H as "hotel / travel") would be presented as facts and
+can steer it toward confident but unsupported conclusions.
+
+This module therefore:
+- keeps published names (amount, card network/type, email domains,
+  DeviceType/Info, addr1/addr2, dist1)
+- omits ProductCD. The letters W/C/H/S/R have no published mapping, so they
+  are not sent to Jev
+- does not gloss C/D columns
+- attaches features computed from the card's prior transactions, with units
+  and time windows in the field names (USD, days, 1h / 24h / 7d)
+- when the request is a card-present authorization, attaches that section
+  (`card_present`) including the real-time rule facts
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any
 
+from app.features.card_present import build_card_present
+from app.features.history import device_identifier_kind, is_device_fingerprint
 from app.schemas.transaction import Transaction
+
+UNKNOWN = "unknown"
+
+# Evidence claims. When history was retrieved and the value is missing, the
+# state says "unknown" so a missing fact is not read as a clean negative.
+_DEVICE_EVIDENCE = frozenset(
+    {
+        "device_identifier_kind",
+        "device_seen_before_on_this_card",
+        "device_is_new_for_card",
+        "current_device_is_trusted",
+        "device_distinct_cards_seen",
+        "device_chargebacks",
+    }
+)
+_HISTORY_EVIDENCE = frozenset(
+    {
+        "history_found",
+        "prior_transaction_count",
+        "card_is_new",
+        "days_since_first_transaction",
+        "days_since_previous_transaction",
+        "mean_amount_usd_prior",
+        "amount_vs_mean_prior_ratio",
+        "transactions_last_1h",
+        "transactions_last_24h",
+        "transactions_last_7d",
+        "amount_usd_last_1h",
+        "amount_usd_last_24h",
+        "amount_usd_last_7d",
+        "distinct_devices_last_24h",
+        "distinct_devices_last_7d",
+        "matching_amount_count_last_24h",
+        "email_domain_seen_before_on_this_card",
+        "chargebacks_on_card",
+        "trusted_device_ids",
+        "recent_attempts",
+        "confirmed_outcomes",
+    }
+)
 
 FREE_EMAIL_DOMAINS = {
     "gmail.com",
@@ -49,18 +100,8 @@ DISPOSABLE_EMAIL_DOMAINS = {
     "anonymous.com",
 }
 
-PRODUCT_CODE_DESCRIPTIONS = {
-    "W": "web purchase of physical goods",
-    "C": "card-not-present digital purchase",
-    "H": "hotel / travel",
-    "S": "service subscription",
-    "R": "recurring billing",
-}
-
-# IEEE-CIS TransactionDT is seconds since an unspecified reference. The community
-# consensus places the reference at 2017-12-01 00:00 UTC; hour-of-day only needs the
-# offset modulo 24h so the exact date does not matter for this feature.
-_REFERENCE_EPOCH = datetime(2017, 12, 1)
+# IEEE-CIS TransactionDT is seconds since an unspecified reference. Hour-of-day
+# only needs the offset modulo 24h, so the exact epoch does not matter.
 
 
 def classify_email_domain(domain: str | None) -> str | None:
@@ -76,28 +117,29 @@ def classify_email_domain(domain: str | None) -> str | None:
     return "corporate_or_isp"
 
 
-def bucket_distance(dist: float | None) -> str | None:
+def bucket_dist1(dist: float | None) -> str | None:
+    """Numeric bins for dist1. Not geographic labels — unit/endpoints unpublished."""
     if dist is None:
         return None
     if dist <= 5:
-        return "local (<=5)"
+        return "<=5"
     if dist <= 50:
-        return "regional (5-50)"
+        return "5-50"
     if dist <= 500:
-        return "distant (50-500)"
-    return "far (>500)"
+        return "50-500"
+    return ">500"
 
 
 def bucket_amount(amount: float) -> str:
     if amount < 10:
-        return "micro (<10)"
+        return "micro (<10 USD)"
     if amount < 100:
-        return "small (10-100)"
+        return "small (10-100 USD)"
     if amount < 500:
-        return "medium (100-500)"
+        return "medium (100-500 USD)"
     if amount < 2000:
-        return "large (500-2000)"
-    return "very large (>2000)"
+        return "large (500-2000 USD)"
+    return "very large (>2000 USD)"
 
 
 def hour_of_day(tx: Transaction) -> int | None:
@@ -108,26 +150,42 @@ def hour_of_day(tx: Transaction) -> int | None:
     return None
 
 
-def _is_new_card(tx: Transaction) -> bool | None:
-    if tx.days_since_card_first_seen is None:
+def _number(v: Any) -> float | None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
         return None
-    return tx.days_since_card_first_seen <= 1
-
-
-def _is_new_device(tx: Transaction) -> bool | None:
-    if tx.days_since_device_first_seen is not None:
-        return tx.days_since_device_first_seen <= 1
-    if tx.device_info and tx.card_known_devices is not None:
-        return tx.device_info not in tx.card_known_devices
-    return None
+    return float(v)
 
 
 def _round(v: float | None, nd: int = 2) -> float | None:
     return None if v is None else round(v, nd)
 
 
-def build_state(tx: Transaction) -> dict[str, Any]:
-    """Return a compact, human-readable JSON state for Jev."""
+def _merge_history(tx: Transaction, history: dict[str, Any] | None) -> dict[str, Any]:
+    """Use retrieved history as-is.
+
+    Caller-supplied averages and device lists apply only when no history dict
+    was retrieved (unit tests and offline callers). A provided dict wins even
+    when some values are missing — those stay unknown rather than being filled
+    from the request.
+    """
+    if history is not None:
+        return dict(history)
+    merged: dict[str, Any] = {}
+    if tx.card_avg_amount and tx.card_avg_amount > 0:
+        merged["mean_amount_usd_prior"] = tx.card_avg_amount
+    if is_device_fingerprint(tx.device_info) and tx.card_known_devices is not None:
+        fingerprints = [d for d in tx.card_known_devices if is_device_fingerprint(d)]
+        merged["device_seen_before_on_this_card"] = tx.device_info in fingerprints
+    return merged
+
+
+def build_state(tx: Transaction, history: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a compact JSON state for Jev. `history` is trusted card evidence.
+
+    When `history` is provided, missing evidence is the string "unknown".
+    When it is omitted, absent fields are dropped.
+    """
+    history_provided = history is not None
     hour = hour_of_day(tx)
     p_domain_type = classify_email_domain(tx.purchaser_email_domain)
     r_domain_type = classify_email_domain(tx.recipient_email_domain)
@@ -137,14 +195,17 @@ def build_state(tx: Transaction) -> dict[str, Any]:
         and tx.recipient_email_domain.lower() != tx.purchaser_email_domain.lower()
     )
 
-    amount_ratio = None
-    if tx.card_avg_amount and tx.card_avg_amount > 0:
-        amount_ratio = tx.amount / tx.card_avg_amount
+    hist = _merge_history(tx, history)
+    mean_prior = _number(hist.get("mean_amount_usd_prior"))
+    amount_ratio = tx.amount / mean_prior if mean_prior and mean_prior > 0 else None
+
+    prior_count = hist.get("prior_transaction_count")
+    card_is_new = None if not isinstance(prior_count, int) or isinstance(prior_count, bool) else prior_count == 0
+    device_seen = hist.get("device_seen_before_on_this_card")
 
     transaction: dict[str, Any] = {
         "amount_usd": _round(tx.amount),
         "amount_bucket": bucket_amount(tx.amount),
-        "product": PRODUCT_CODE_DESCRIPTIONS.get(tx.product_code or "", tx.product_code),
         "hour_of_day_utc": hour,
         "is_night_time": (hour is not None and (hour < 6 or hour >= 23)) if hour is not None else None,
         "card_network": tx.card_network,
@@ -154,45 +215,66 @@ def build_state(tx: Transaction) -> dict[str, Any]:
         "recipient_email_domain": tx.recipient_email_domain,
         "recipient_email_domain_type": r_domain_type,
         "purchaser_recipient_email_mismatch": email_mismatch if tx.recipient_email_domain else None,
-        "billing_region_code": tx.billing_region,
-        "billing_country_code": tx.billing_country,
-        "distance_billing_to_purchase": _round(tx.distance_billing_to_purchase),
-        "distance_bucket": bucket_distance(tx.distance_billing_to_purchase),
+        "addr1": tx.billing_region,
+        "addr2": tx.billing_country,
+        "dist1": _round(tx.dist1),
+        "dist1_bucket": bucket_dist1(tx.dist1),
     }
 
     device: dict[str, Any] = {
         "device_type": tx.device_type,
         "device_info": tx.device_info,
-        "device_is_new_for_card": _is_new_device(tx),
-        "days_since_device_first_seen": _round(tx.days_since_device_first_seen, 1),
-        "transactions_from_this_device": _round(tx.device_txn_count, 0),
+        "device_identifier_kind": device_identifier_kind(tx.device_info),
+        "device_seen_before_on_this_card": device_seen if isinstance(device_seen, bool) else None,
+        "device_is_new_for_card": None if not isinstance(device_seen, bool) else not device_seen,
+        "current_device_is_trusted": hist.get("current_device_is_trusted"),
+        "device_distinct_cards_seen": hist.get("device_distinct_cards_seen"),
+        "device_chargebacks": hist.get("device_chargebacks"),
     }
 
-    velocity: dict[str, Any] = {
-        "card_transaction_count": _round(tx.card_txn_count, 0),
-        "email_transaction_count": _round(tx.email_txn_count, 0),
-        "address_match_count": _round(tx.addr_match_count, 0),
-        "days_since_previous_transaction": _round(tx.days_since_prev_txn, 1),
-        "days_since_card_first_seen": _round(tx.days_since_card_first_seen, 1),
-        "card_is_new": _is_new_card(tx),
-        "days_since_prev_txn_same_address": _round(tx.days_since_prev_txn_same_addr, 1),
-        "days_since_prev_txn_same_amount": _round(tx.days_since_prev_txn_same_amount, 1),
-        "repeat_of_recent_amount": (
-            tx.days_since_prev_txn_same_amount is not None and tx.days_since_prev_txn_same_amount <= 1
-        )
-        if tx.days_since_prev_txn_same_amount is not None
-        else None,
-        "card_average_amount_usd": _round(tx.card_avg_amount),
-        "amount_vs_card_average_ratio": _round(amount_ratio),
+    card_history: dict[str, Any] = {
+        "history_found": hist.get("history_found"),
+        "prior_transaction_count": prior_count,
+        "card_is_new": card_is_new,
+        "days_since_first_transaction": _round(hist.get("days_since_first_transaction"), 1),
+        "days_since_previous_transaction": _round(hist.get("days_since_previous_transaction"), 1),
+        "mean_amount_usd_prior": _round(mean_prior),
+        "amount_vs_mean_prior_ratio": _round(amount_ratio),
+        "transactions_last_1h": hist.get("transactions_last_1h"),
+        "transactions_last_24h": hist.get("transactions_last_24h"),
+        "transactions_last_7d": hist.get("transactions_last_7d"),
+        "amount_usd_last_1h": _round(hist.get("amount_usd_last_1h")),
+        "amount_usd_last_24h": _round(hist.get("amount_usd_last_24h")),
+        "amount_usd_last_7d": _round(hist.get("amount_usd_last_7d")),
+        "distinct_devices_last_24h": hist.get("distinct_devices_last_24h"),
+        "distinct_devices_last_7d": hist.get("distinct_devices_last_7d"),
+        "matching_amount_count_last_24h": hist.get("matching_amount_count_last_24h"),
+        "email_domain_seen_before_on_this_card": hist.get("email_domain_seen_before_on_this_card"),
+        "chargebacks_on_card": hist.get("chargebacks_on_card"),
+        "trusted_device_ids": hist.get("trusted_device_ids"),
+        "recent_attempts": hist.get("recent_attempts"),
+        "confirmed_outcomes": hist.get("confirmed_outcomes"),
     }
 
     state = {
         "transaction": _prune(transaction),
-        "device": _prune(device),
-        "velocity": _prune(velocity),
+        "device": _finalize(device, _DEVICE_EVIDENCE, history_provided),
+        "card_history": _finalize(card_history, _HISTORY_EVIDENCE, history_provided),
+        "card_present": build_card_present(tx, hist, history_provided=history_provided),
     }
     return {k: v for k, v in state.items() if v}
 
 
 def _prune(d: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in d.items() if v is not None}
+
+
+def _finalize(d: dict[str, Any], evidence: frozenset[str], history_provided: bool) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in d.items():
+        if value is None:
+            if history_provided and key in evidence:
+                out[key] = UNKNOWN
+            continue
+        out[key] = value
+    return out

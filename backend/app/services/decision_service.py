@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 
 from app.agent.feature_store import FeatureStore
 from app.agent.investigator import Investigator
+from app.features.card_present import authorization_decline_reason
 from app.features.state_builder import build_state
 from app.jev.classifier import FraudClassifier
 from app.policy.decision import PolicyThresholds, decide
@@ -51,9 +52,26 @@ class DecisionService:
 
     # Scoring -----------------------------------------------------------------------
     async def score(self, tx: Transaction) -> ScoreResponse:
-        state = build_state(tx)
+        # APPROVE and DECLINE skip investigation, so this lookup is the only
+        # history Jev sees. It comes from the feature store, not the request.
+        trusted = self.feature_store.history_features(tx)
+        state = build_state(tx, history=trusted)
         answers = await self.classifier.classify(state)
         outcome, explanation = decide(answers, self.thresholds)
+        # Hard issuer controls decline the network response. Jev has already
+        # scored the same card_present state; these are not fraud judgments.
+        block = authorization_decline_reason(state)
+        if block:
+            outcome = DecisionOutcome.DECLINE
+            explanation = explanation.model_copy(
+                update={
+                    "rule": (
+                        f"real-time authorization decline: {block}. "
+                        f"Jev scored this card-present state at is_fraud.p={explanation.fraud_probability:.3f}"
+                    ),
+                    "review_reason": None,
+                }
+            )
 
         record = DecisionRecord(
             decision_id=f"dec_{uuid.uuid4().hex[:12]}",
@@ -77,7 +95,7 @@ class DecisionService:
                 record.investigation = InvestigationRecord(status="skipped")
         else:
             record.final_decision = outcome
-            record.final_reason = "decided by Jev policy"
+            record.final_reason = explanation.rule if block else "decided by Jev policy"
             record.investigation = InvestigationRecord(status="skipped")
             self.feature_store.record(tx, "approved" if outcome == DecisionOutcome.APPROVE else "declined")
 
