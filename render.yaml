@@ -1,0 +1,31 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# From the dashboard: New → Blueprint → this repo.
+services:
+  - type: web
+    name: fraud-classifier
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: TYPESAFE_API_KEY
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: LLM_FAST
+        value: google_genai:gemini-2.5-flash
+      - key: AGENT_ENABLED
+        value: "true"
+      - key: OTP_DEV_MODE
+        value: "true"
+      - key: SERVE_FRONTEND
+        value: "true"
+      - key: FRONTEND_DIST
+        value: /app/frontend/dist
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: LOG_LEVEL
+        value: INFO
