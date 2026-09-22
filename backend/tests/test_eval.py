@@ -126,10 +126,12 @@ def test_card_history_features_are_time_respecting():
     assert second["prior_transaction_count"] == 1
     assert second["transactions_last_1h"] == 1
     assert second["matching_amount_count_last_24h"] == 1
-    assert bool(second["device_seen_before_on_this_card"]) is True
+    assert pd.isna(second["device_seen_before_on_this_card"])
+    assert pd.isna(second["distinct_devices_last_24h"])
     assert third["prior_transaction_count"] == 2
     assert third["transactions_last_24h"] == 2
-    assert bool(third["device_seen_before_on_this_card"]) is False
+    assert pd.isna(third["device_seen_before_on_this_card"])
+    assert pd.isna(third["distinct_devices_last_7d"])
     assert other["prior_transaction_count"] == 0
     hist = row_history(second)
     assert hist["prior_transaction_count"] == 1

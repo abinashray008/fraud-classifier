@@ -103,22 +103,29 @@ def test_finalize_otp_failure_declines(status):
     assert status.value.lower() in reason
 
 
-def test_finalize_verified_without_verdict_approves():
-    final, reason = finalize(ChallengeStatus.VERIFIED, None)
+@pytest.mark.parametrize("status", ["not_started", "running", "failed", "completed", "skipped"])
+def test_finalize_required_investigation_without_verdict_stays_pending(status):
+    final, reason = finalize(ChallengeStatus.VERIFIED, None, investigation_status=status)
+    assert final is None
+    assert "investigation" in reason
+
+
+def test_finalize_disabled_investigation_allows_otp_only_authorization():
+    final, reason = finalize(
+        ChallengeStatus.VERIFIED, None, investigation_status="skipped", investigation_required=False
+    )
     assert final == DecisionOutcome.APPROVE
-    assert "not yet complete" in reason
-    _, reason = finalize(ChallengeStatus.VERIFIED, None, investigation_status="skipped")
     assert "disabled" in reason
-    _, reason = finalize(ChallengeStatus.VERIFIED, None, investigation_status="failed")
-    assert "failed" in reason
 
 
 def test_finalize_verified_with_strong_verdict_declines():
-    final, reason = finalize(ChallengeStatus.VERIFIED, _verdict(0.95), agent_decline_prob=0.9)
+    final, reason = finalize(
+        ChallengeStatus.VERIFIED, _verdict(0.95), agent_decline_prob=0.9, investigation_status="completed"
+    )
     assert final == DecisionOutcome.DECLINE
     assert "0.95" in reason
 
 
 def test_finalize_verified_with_weak_verdict_approves():
-    final, _ = finalize(ChallengeStatus.VERIFIED, _verdict(0.4))
+    final, _ = finalize(ChallengeStatus.VERIFIED, _verdict(0.4), investigation_status="completed")
     assert final == DecisionOutcome.APPROVE

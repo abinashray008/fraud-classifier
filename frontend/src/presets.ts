@@ -8,8 +8,8 @@ export interface Preset {
 }
 
 // Seeds match backend/app/agent/feature_store.py::seed_demo so live scoring
-// computes card history for these card_ids. The legit device string is
-// DEMO_TRUSTED_DEVICE; "Windows" and "iOS Device" are descriptions, not ids.
+// computes card history for these card_ids. Device IDs are synthetic enrolled
+// identities; all device_info values remain descriptions.
 export const PRESETS: Preset[] = [
   {
     id: 'legit',
@@ -27,12 +27,13 @@ export const PRESETS: Preset[] = [
       timestamp_delta_seconds: 86400 * 10 + 14 * 3600,
       device_type: 'mobile',
       device_info: 'SM-G950F Build/R16NW',
+      device_id: 'demo:device:good-001',
     },
   },
   {
     id: 'ambiguous',
-    label: 'Ambiguous: new device, larger amount',
-    description: 'Established card but first purchase from a new device at 3x the usual amount.',
+    label: 'Ambiguous: unknown device, larger amount',
+    description: 'Established card with unknown device identity at roughly 5x the usual amount.',
     tx: {
       card_id: 'card_ato_002',
       amount: 189.99,
@@ -64,6 +65,7 @@ export const PRESETS: Preset[] = [
       timestamp_delta_seconds: 86400 * 3 + 3 * 3600,
       device_type: 'mobile',
       device_info: 'SM-G9650 Build/R16NW',
+      device_id: 'demo:device:shared-001',
     },
   },
   {
@@ -139,7 +141,7 @@ export const PRESETS: Preset[] = [
     id: 'swipe_stolen',
     label: 'Card-present: stolen card',
     description:
-      'Card status is stolen. The real-time control declines the network response; Jev still scores the same card_present state.',
+      'Card status is stolen. The issuer control declines before the model is called.',
     tx: {
       card_id: 'card_swipe_001',
       amount: 48,

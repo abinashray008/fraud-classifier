@@ -1,4 +1,4 @@
-import type { DecisionRecord, ScoreResponse } from '../api/types'
+import type { DecisionRecord, JevAnswers, ScoreResponse } from '../api/types'
 import { DecisionBadge } from '../components/DecisionBadge'
 import { ProbabilityBar } from '../components/ProbabilityBar'
 
@@ -9,17 +9,12 @@ interface Props {
 
 export function DecisionInspector({ score, record }: Props) {
   const { jev, explanation } = score
-  const levels = Object.keys(jev.risk.legend)
-    .map(Number)
-    .sort((a, b) => a - b)
-  const maxLevel = levels[levels.length - 1] ?? 4
-  const patterns = Object.entries(jev.pattern.probabilities).sort((a, b) => b[1] - a[1])
   const final = record?.final_decision ?? (score.decision !== 'STEP_UP' ? score.decision : null)
 
   return (
     <div className="card inspector">
       <div className="card-head">
-        <h2>Jev decision</h2>
+        <h2>{jev ? 'Jev decision' : 'Decision'}</h2>
         <div className="badges">
           <DecisionBadge decision={score.decision} size="lg" />
           {score.decision === 'STEP_UP' && (
@@ -32,16 +27,16 @@ export function DecisionInspector({ score, record }: Props) {
       </div>
 
       <div className="meta mono">
-        <span>{jev.model}</span>
-        {jev.latency_ms != null && <span>{jev.latency_ms.toFixed(0)} ms</span>}
-        {jev.input_tokens != null && <span>{jev.input_tokens} in / {jev.output_tokens ?? 0} out tokens</span>}
+        {jev ? <span>{jev.model}</span> : <span>model not called</span>}
+        {jev?.latency_ms != null && <span>{jev.latency_ms.toFixed(0)} ms</span>}
+        {jev?.input_tokens != null && <span>{jev.input_tokens} in / {jev.output_tokens ?? 0} out tokens</span>}
         <span>{score.decision_id}</span>
       </div>
 
       {record && <CardPresentAmount state={record.state} />}
 
       <section>
-        <ProbabilityBar label="is_fraud (Noul)" value={jev.is_fraud.noul} />
+        {jev && <ProbabilityBar label="is_fraud (Noul)" value={jev.is_fraud.noul} />}
         <div className="thresholds mono small">
           <span>t_low {explanation.t_low}</span>
           <span>t_high {explanation.t_high}</span>
@@ -57,6 +52,27 @@ export function DecisionInspector({ score, record }: Props) {
         )}
       </section>
 
+      {jev && <JevAnswersView jev={jev} />}
+
+      {record && (
+        <details>
+          <summary>{jev ? 'State sent to Jev' : 'State (model not called)'}</summary>
+          <pre className="state">{JSON.stringify(record.state, null, 2)}</pre>
+        </details>
+      )}
+    </div>
+  )
+}
+
+function JevAnswersView({ jev }: { jev: JevAnswers }) {
+  const levels = Object.keys(jev.risk.legend)
+    .map(Number)
+    .sort((a, b) => a - b)
+  const maxLevel = levels[levels.length - 1] ?? 4
+  const patterns = Object.entries(jev.pattern.probabilities).sort((a, b) => b[1] - a[1])
+
+  return (
+    <>
       <section>
         <h3>
           Risk score (Score) <span className="mono">{jev.risk.score.toFixed(2)} / {maxLevel}</span>{' '}
@@ -101,14 +117,7 @@ export function DecisionInspector({ score, record }: Props) {
           ))}
         </section>
       )}
-
-      {record && (
-        <details>
-          <summary>State sent to Jev</summary>
-          <pre className="state">{JSON.stringify(record.state, null, 2)}</pre>
-        </details>
-      )}
-    </div>
+    </>
   )
 }
 

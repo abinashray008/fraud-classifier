@@ -222,7 +222,8 @@ def add_card_history_features(df: pd.DataFrame) -> pd.DataFrame:
     """Attach per-card history features using only earlier TransactionDT rows.
 
     C/D columns are left untouched (opaque). Features here are computed from
-    TransactionAmt, TransactionDT, DeviceInfo, and P_emaildomain.
+    TransactionAmt, TransactionDT, and P_emaildomain. IEEE-CIS DeviceInfo is
+    descriptive; no trusted device_id is available, so identity stays unknown.
     """
     df = df.sort_values(["card_id", "TransactionDT"]).copy()
     feats_by_index: dict[object, dict] = {}

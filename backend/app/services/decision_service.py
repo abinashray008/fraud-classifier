@@ -1,4 +1,4 @@
-"""Orchestrates: build state -> Jev classify -> policy -> (challenge + async investigation)."""
+"""Orchestrates: build state -> hard controls -> Jev classify -> policy -> (challenge + async investigation)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 
 from app.agent.feature_store import FeatureStore
 from app.agent.investigator import Investigator
-from app.features.card_present import authorization_decline_reason
+from app.features.controls import decline_before_model
 from app.features.state_builder import build_state
 from app.jev.classifier import FraudClassifier
 from app.policy.decision import PolicyThresholds, decide
@@ -19,6 +19,7 @@ from app.schemas.transaction import (
     DecisionOutcome,
     DecisionRecord,
     InvestigationRecord,
+    PolicyExplanation,
     ScoreResponse,
     Transaction,
     VerifyResponse,
@@ -27,6 +28,10 @@ from app.stepup.otp import OtpService
 from app.store.memory import MemoryStore
 
 logger = logging.getLogger(__name__)
+
+
+def _authorization_label(decision: DecisionOutcome | None) -> str:
+    return {DecisionOutcome.APPROVE: "approved", DecisionOutcome.DECLINE: "declined"}.get(decision, "pending")
 
 
 class DecisionService:
@@ -52,30 +57,34 @@ class DecisionService:
 
     # Scoring -----------------------------------------------------------------------
     async def score(self, tx: Transaction) -> ScoreResponse:
-        # APPROVE and DECLINE skip investigation, so this lookup is the only
-        # history Jev sees. It comes from the feature store, not the request.
-        trusted = self.feature_store.history_features(tx)
-        state = build_state(tx, history=trusted)
-        answers = await self.classifier.classify(state)
-        outcome, explanation = decide(answers, self.thresholds)
-        # Hard issuer controls decline the network response. Jev has already
-        # scored the same card_present state; these are not fraud judgments.
-        block = authorization_decline_reason(state)
+        decision_id = f"dec_{uuid.uuid4().hex[:12]}"
+        received_at = datetime.now(UTC)
+        attempt = tx if tx.transaction_time is not None else tx.model_copy(update={"transaction_time": received_at})
+        # Snapshot prior history before inserting this attempt so it never counts
+        # itself. Both operations are synchronous, before any model/OTP await;
+        # other requests see the attempt even while this one is still processing.
+        history = self.feature_store.history_features(attempt)
+        self.feature_store.record(attempt, "pending", record_id=decision_id)
+        state = build_state(tx, history=history)
+        # Issuer controls (stolen, blocked, over limit) and card-present controls
+        # (track CVV, PIN) decline before the model call. A timeout cannot hide them,
+        # and card-not-present does not drop the issuer controls.
+        block = decline_before_model(tx)
         if block:
+            answers = None
             outcome = DecisionOutcome.DECLINE
-            explanation = explanation.model_copy(
-                update={
-                    "rule": (
-                        f"real-time authorization decline: {block}. "
-                        f"Jev scored this card-present state at is_fraud.p={explanation.fraud_probability:.3f}"
-                    ),
-                    "review_reason": None,
-                }
+            explanation = PolicyExplanation(
+                rule=(f"hard control decline before the model call: {block}. The classifier was not called."),
+                t_low=self.thresholds.t_low,
+                t_high=self.thresholds.t_high,
             )
+        else:
+            answers = await self.classifier.classify(state)
+            outcome, explanation = decide(answers, self.thresholds)
 
         record = DecisionRecord(
-            decision_id=f"dec_{uuid.uuid4().hex[:12]}",
-            created_at=datetime.now(UTC),
+            decision_id=decision_id,
+            created_at=received_at,
             transaction=tx,
             state=state,
             jev=answers,
@@ -85,21 +94,29 @@ class DecisionService:
 
         dev_code: str | None = None
         if outcome == DecisionOutcome.STEP_UP:
+            assert answers is not None
             challenge = await self.otp.create_challenge(record.decision_id)
             record.challenge_id = challenge.challenge_id
             dev_code = challenge.dev_code
             if self.investigator is not None:
                 record.investigation = InvestigationRecord(status="running", started_at=datetime.now(UTC))
-                self._spawn(self._run_investigation(record.decision_id, tx, state, answers))
+                record.investigation_required = True
             else:
                 record.investigation = InvestigationRecord(status="skipped")
         else:
             record.final_decision = outcome
-            record.final_reason = explanation.rule if block else "decided by Jev policy"
+            record.final_reason = explanation.rule if answers is None else "decided by Jev policy"
             record.investigation = InvestigationRecord(status="skipped")
-            self.feature_store.record(tx, "approved" if outcome == DecisionOutcome.APPROVE else "declined")
 
+        self.feature_store.record(
+            tx,
+            _authorization_label(record.final_decision),
+            record_id=record.decision_id,
+        )
         await self.store.put_decision(record)
+        if record.investigation_required:
+            # Persist first: even an immediately completing investigator can find the record.
+            self._spawn(self._run_investigation(record.decision_id, tx, state, answers))
         return ScoreResponse(
             decision_id=record.decision_id,
             decision=outcome,
@@ -128,8 +145,7 @@ class DecisionService:
         if record is None:
             return
         record.investigation = result
-        # If the OTP already resolved, re-run the final policy so a late strong verdict
-        # is reflected in the record (the client can fetch it via GET /decisions/{id}).
+        # Resolve only after OTP and all required investigation evidence are ready.
         if record.challenge_id:
             challenge = await self.store.get_challenge(record.challenge_id)
             if challenge and challenge.status != ChallengeStatus.PENDING:
@@ -155,16 +171,20 @@ class DecisionService:
 
     def _apply_final(self, record: DecisionRecord, status: ChallengeStatus) -> None:
         verdict = record.investigation.verdict if record.investigation else None
-        final, reason = finalize(status, verdict, self.agent_decline_prob, record.investigation.status)
-        if final is None:
-            return
-        changed = record.final_decision != final
+        final, reason = finalize(
+            status,
+            verdict,
+            self.agent_decline_prob,
+            record.investigation.status,
+            investigation_required=record.investigation_required,
+        )
         record.final_decision = final
         record.final_reason = reason
-        if changed:
-            self.feature_store.record(
-                record.transaction, "approved" if final == DecisionOutcome.APPROVE else "declined"
-            )
+        self.feature_store.record(
+            record.transaction,
+            _authorization_label(final),
+            record_id=record.decision_id,
+        )
 
     async def wait_for_background(self) -> None:
         """Test helper: wait for outstanding investigations."""

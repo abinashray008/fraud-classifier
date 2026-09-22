@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
 
 class Transaction(BaseModel):
@@ -67,7 +67,17 @@ class Transaction(BaseModel):
 
     # Identity table fields
     device_type: str | None = Field(default=None, alias="DeviceType")
-    device_info: str | None = Field(default=None, alias="DeviceInfo")
+    device_info: str | None = Field(
+        default=None, alias="DeviceInfo", description="Device/OS/build description; never a device identity."
+    )
+    device_id: str | None = Field(
+        default=None,
+        description=(
+            "Opaque, stable device key supplied by a trusted server integration after verifying device enrollment. "
+            "Namespace by issuer/provider; never derive from DeviceInfo, model, OS, build or user agent. "
+            "This demo assumes trusted callers; it does not authenticate the provenance of this field."
+        ),
+    )
 
     # Opaque IEEE-CIS C (counts) and D (timedeltas). Meanings masked; not sent to Jev.
     c1: float | None = Field(default=None, alias="C1")
@@ -80,12 +90,15 @@ class Transaction(BaseModel):
     d10: float | None = Field(default=None, alias="D10")
     d15: float | None = Field(default=None, alias="D15")
 
-    # Card-present authorization. Set when the cardholder is at a merchant terminal
-    # and the acquirer has sent the request through the card network for an
-    # approve or decline. Omitted for card-not-present and IEEE-CIS rows.
+    # Channel and issuer status apply to either authorization path. Terminal facts
+    # (entry mode, CVM, track CVV, terminal) are card-present only; combining them
+    # with channel=card_not_present is rejected. Omitted on IEEE-CIS rows.
     channel: Literal["card_present", "card_not_present"] | None = None
     entry_mode: Literal["swipe", "chip", "contactless", "fallback_swipe", "keyed"] | None = None
-    card_status: Literal["open", "lost", "stolen", "expired", "blocked"] | None = None
+    card_status: Literal["open", "lost", "stolen", "expired", "blocked"] | None = Field(
+        default=None,
+        description="Issuer card status. Lost, stolen, expired, and blocked decline before scoring on either channel.",
+    )
     cvm_result: Literal["pin_verified", "pin_failed", "signature", "no_cvm"] | None = None
     pin_tries_exceeded: bool | None = None
     track_cvv: Literal["match", "mismatch", "not_present"] | None = Field(
@@ -114,10 +127,17 @@ class Transaction(BaseModel):
     )
     card_known_devices: list[str] | None = Field(
         default=None,
-        description="DeviceInfo values previously seen on this card. Live scoring does not use this.",
+        description="Legacy DeviceInfo descriptions; accepted for compatibility but never used as device identities.",
     )
 
     model_config = {"populate_by_name": True, "extra": "ignore"}
+
+    @field_validator("device_id")
+    @classmethod
+    def _validate_device_id(cls, value: str | None) -> str | None:
+        if value is not None and (not value.strip() or value != value.strip()):
+            raise ValueError("device_id must be nonempty with no surrounding whitespace")
+        return value
 
     @field_validator(
         "billing_region",
@@ -146,6 +166,15 @@ class Transaction(BaseModel):
         if isinstance(v, float) and v.is_integer():
             return str(int(v))
         return str(v)
+
+    @model_validator(mode="after")
+    def _reject_contradictory_channel(self):
+        from app.features.controls import contradictory_channel
+
+        reason = contradictory_channel(self)
+        if reason:
+            raise ValueError(reason)
+        return self
 
 
 class DecisionOutcome(StrEnum):
@@ -192,10 +221,11 @@ class PolicyExplanation(BaseModel):
     rule: str
     t_low: float
     t_high: float
-    fraud_probability: float
-    risk_score: float
+    # Absent when a hard control declined before the model was called.
+    fraud_probability: float | None = None
+    risk_score: float | None = None
     # Concentration of the risk-level distribution. Not P(the fraud answer is correct).
-    risk_confidence: float
+    risk_confidence: float | None = None
     review_reason: Literal["contradictory", "insufficient_evidence", "ambiguous"] | None = None
 
 
@@ -250,19 +280,21 @@ class DecisionRecord(BaseModel):
     created_at: datetime
     transaction: Transaction
     state: dict
-    jev: JevAnswers
+    # None when a hard control declined before the model was called.
+    jev: JevAnswers | None = None
     decision: DecisionOutcome
     explanation: PolicyExplanation
     challenge_id: str | None = None
     final_decision: DecisionOutcome | None = None
     final_reason: str | None = None
+    investigation_required: bool = False
     investigation: InvestigationRecord = Field(default_factory=InvestigationRecord)
 
 
 class ScoreResponse(BaseModel):
     decision_id: str
     decision: DecisionOutcome
-    jev: JevAnswers
+    jev: JevAnswers | None = None
     explanation: PolicyExplanation
     challenge_id: str | None = None
     # Dev mode only

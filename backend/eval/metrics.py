@@ -26,6 +26,7 @@ from sklearn.metrics import (
 
 from app.policy.decision import FRAUD_PATTERNS, PolicyThresholds
 from eval.calibration import probability_calibration
+from eval.load_ieee import SPLIT_ORDER
 
 
 def decisions(df: pd.DataFrame, t_low: float, t_high: float, th: PolicyThresholds | None = None) -> pd.Series:
@@ -105,9 +106,17 @@ def sample_weights(df: pd.DataFrame) -> np.ndarray | None:
 
 
 def frame_for(df: pd.DataFrame, split: str) -> pd.DataFrame:
-    """Keep one chronological split. Frames with no split column are returned as-is."""
+    """Keep one chronological split, rejecting legacy or ambiguous metadata."""
+    if split not in SPLIT_ORDER:
+        raise ValueError(f"unknown evaluation split {split!r}")
+    rebuild = "Rebuild the sample with eval.load_ieee and rescore with eval.run_eval."
     if "split" not in df.columns:
-        return df
+        raise ValueError(f"answers require split metadata. {rebuild}")
+    if not df["split"].isin(SPLIT_ORDER).all():
+        raise ValueError(f"answers contain missing or invalid split metadata. {rebuild}")
+    if "transaction_id" in df.columns:
+        if df.groupby("transaction_id")["split"].nunique().gt(1).any():
+            raise ValueError(f"answers contain transactions in multiple splits. {rebuild}")
     out = df[df["split"] == split]
     if out.empty:
         raise ValueError(f"answers have a split column but no {split!r} rows")

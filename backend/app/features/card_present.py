@@ -6,11 +6,12 @@ declines. This module turns that request into named facts. It does not invent
 meanings for masked IEEE-CIS columns; those rows never carry these fields, and
 the section is omitted.
 
-`rules` are the real-time checks. Hard controls (unusable card, track-CVV
-mismatch, PIN failure, over limit) also decline in `authorization_decline_reason`
-so a low fraud score cannot approve them. Amount, fallback, travel, cash-like
-MCC, and merchant bursts stay in `rules` for Jev to weigh as fraud evidence.
-`over_limit` is a credit control. `amount_far_above_history` and
+`rules` records the real-time checks. Issuer controls (unusable card, credit
+limit) and presentment controls (track CVV, PIN) decline in
+`decline_before_model` before the classifier is called; this section still
+lists those flags when the request is card-present. Amount, fallback, travel,
+cash-like MCC, and merchant bursts stay in `rules` for Jev to weigh as fraud
+evidence. `over_limit` is a credit control. `amount_far_above_history` and
 `probing_amount` are fraud checks on the authorization amount.
 """
 
@@ -18,15 +19,16 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.features.controls import issuer_control_flags, presentment_control_flags
 from app.schemas.transaction import Transaction
 
 # ISO 18245 codes issuers treat as cash-equivalent on a card-present auth.
 CASH_LIKE_MCCS = frozenset({"4829", "6010", "6011", "6051", "7995"})
 
-_UNUSABLE = frozenset({"lost", "stolen", "expired", "blocked"})
+# Card status and credit limits are issuer facts, not evidence that the
+# cardholder is at a terminal. They do not by themselves open this section.
 _PRESENTMENT_ATTRS = (
     "entry_mode",
-    "card_status",
     "cvm_result",
     "pin_tries_exceeded",
     "track_cvv",
@@ -38,8 +40,6 @@ _PRESENTMENT_ATTRS = (
     "terminal_id",
     "terminal_attended",
     "cardholder_country",
-    "available_credit_usd",
-    "single_purchase_limit_usd",
 )
 
 ENTRY_MODE_MEANING = {
@@ -71,13 +71,6 @@ MERCHANT_EVIDENCE = frozenset(
 FAR_ABOVE_MEAN = 4.0
 PROBE_AMOUNT_USD = 1.0
 REPEATED_SMALL_USD = 10.0
-
-HARD_RULES = {
-    "card_unusable": "card is lost, stolen, expired, or blocked",
-    "track_cvv_mismatch": "magstripe track CVV does not match",
-    "pin_failure": "PIN failed or the PIN try limit is exceeded",
-    "over_limit": "amount is above available credit or the single-purchase limit",
-}
 
 UNKNOWN = "unknown"
 
@@ -131,19 +124,8 @@ def _amount_facts(tx: Transaction, hist: dict[str, Any], *, history_provided: bo
 
 def _rules(tx: Transaction, hist: dict[str, Any]) -> dict[str, bool]:
     rules: dict[str, bool] = {}
-    if tx.card_status is not None:
-        rules["card_unusable"] = tx.card_status in _UNUSABLE
-    if tx.track_cvv is not None:
-        rules["track_cvv_mismatch"] = tx.track_cvv == "mismatch"
-    if tx.cvm_result is not None or tx.pin_tries_exceeded is not None:
-        rules["pin_failure"] = tx.cvm_result == "pin_failed" or tx.pin_tries_exceeded is True
-    if tx.available_credit_usd is not None or tx.single_purchase_limit_usd is not None:
-        over = False
-        if tx.available_credit_usd is not None and tx.amount > tx.available_credit_usd:
-            over = True
-        if tx.single_purchase_limit_usd is not None and tx.amount > tx.single_purchase_limit_usd:
-            over = True
-        rules["over_limit"] = over
+    rules.update(issuer_control_flags(tx))
+    rules.update(presentment_control_flags(tx))
     if tx.entry_mode is not None:
         rules["magstripe_fallback"] = tx.entry_mode == "fallback_swipe"
         if tx.cvm_result in {"signature", "no_cvm"} and tx.entry_mode in {"swipe", "fallback_swipe"}:
@@ -232,16 +214,3 @@ def build_card_present(
     if rules:
         section["rules"] = rules
     return section
-
-
-def authorization_decline_reason(state: dict[str, Any]) -> str | None:
-    """Hard controls that must decline the network response.
-
-    Jev still scores the same state. These checks are binary issuer controls:
-    a low fraud probability does not make a lost card or a bad track CVV approvable.
-    """
-    rules = (state.get("card_present") or {}).get("rules") or {}
-    fired = [f"{name} ({text})" for name, text in HARD_RULES.items() if rules.get(name) is True]
-    if not fired:
-        return None
-    return "; ".join(fired)

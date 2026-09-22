@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { VerifyResponse } from '../api/types'
+import type { DecisionRecord, VerifyResponse } from '../api/types'
 import { api, ApiError } from '../api/client'
 import { DecisionBadge } from './DecisionBadge'
 
@@ -7,9 +7,10 @@ interface Props {
   challengeId: string
   devCode: string | null
   onResult: (r: VerifyResponse) => void
+  record: DecisionRecord | null
 }
 
-export function OtpChallenge({ challengeId, devCode, onResult }: Props) {
+export function OtpChallenge({ challengeId, devCode, onResult, record }: Props) {
   const [code, setCode] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -31,6 +32,8 @@ export function OtpChallenge({ challengeId, devCode, onResult }: Props) {
     }
   }
 
+  const finalDecision = record ? record.final_decision : result?.final_decision ?? null
+  const finalReason = record ? record.final_reason : result?.final_reason
   const resolved = result && result.challenge_status !== 'PENDING'
 
   return (
@@ -71,9 +74,9 @@ export function OtpChallenge({ challengeId, devCode, onResult }: Props) {
             OTP <strong>{result.challenge_status}</strong>
           </div>
           <div className="final">
-            Final decision: <DecisionBadge decision={result.final_decision} />
+            {finalDecision ? 'Final decision: ' : 'Authorization: '}<DecisionBadge decision={finalDecision} />
           </div>
-          <div className="muted">{result.final_reason}</div>
+          <div className="muted">{finalReason}</div>
         </div>
       )}
     </div>

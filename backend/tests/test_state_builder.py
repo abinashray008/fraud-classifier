@@ -1,6 +1,10 @@
 from datetime import UTC, datetime, timedelta
 
-from app.agent.feature_store import DEMO_TRUSTED_DEVICE, FeatureStore
+import pytest
+from pydantic import ValidationError
+
+from app.agent.feature_store import DEMO_SHARED_DEVICE, DEMO_TRUSTED_DEVICE, FeatureStore
+from app.features.controls import decline_before_model
 from app.features.history import PriorTxn, compute_card_history_features
 from app.features.state_builder import bucket_dist1, build_state, classify_email_domain
 from app.schemas.transaction import Transaction
@@ -35,7 +39,7 @@ def test_build_state_drops_none_and_derives_features():
     assert t["dist1_bucket"] == ">500"
     assert "addr1" not in t  # None pruned
     assert state["card_history"]["amount_vs_mean_prior_ratio"] == 25.0
-    assert state["device"]["device_is_new_for_card"] is True
+    assert "device_is_new_for_card" not in state["device"]
 
 
 def test_product_code_is_not_sent_to_jev():
@@ -65,14 +69,30 @@ def test_masked_c_d_columns_are_not_interpreted_in_state():
 def test_history_features_have_units_and_windows():
     at = datetime(2026, 1, 10, tzinfo=UTC)
     prior = [
-        PriorTxn(amount=40.0, timestamp=at - timedelta(days=10), device_info="SM-A Build/1", email_domain="gmail.com"),
-        PriorTxn(amount=40.0, timestamp=at - timedelta(hours=2), device_info="SM-A Build/1", email_domain="gmail.com"),
         PriorTxn(
-            amount=40.0, timestamp=at - timedelta(minutes=30), device_info="SM-B Build/2", email_domain="gmail.com"
+            amount=40.0,
+            timestamp=at - timedelta(days=10),
+            device_info="SM-A Build/1",
+            device_id="test:device:a",
+            email_domain="gmail.com",
+        ),
+        PriorTxn(
+            amount=40.0,
+            timestamp=at - timedelta(hours=2),
+            device_info="SM-A Build/1",
+            device_id="test:device:a",
+            email_domain="gmail.com",
+        ),
+        PriorTxn(
+            amount=40.0,
+            timestamp=at - timedelta(minutes=30),
+            device_info="SM-B Build/2",
+            device_id="test:device:b",
+            email_domain="gmail.com",
         ),
     ]
     hist = compute_card_history_features(
-        prior=prior, amount=40.0, at=at, device_info="SM-B Build/2", email_domain="gmail.com"
+        prior=prior, amount=40.0, at=at, device_info="SM-B Build/2", device_id="test:device:b", email_domain="gmail.com"
     )
     assert hist["history_found"] is True
     assert hist["prior_transaction_count"] == 3
@@ -86,20 +106,20 @@ def test_history_features_have_units_and_windows():
     assert hist["device_seen_before_on_this_card"] is True
     assert hist["email_domain_seen_before_on_this_card"] is True
 
-    state = build_state(Transaction(amount=40.0, DeviceInfo="SM-B Build/2"), history=hist)
+    state = build_state(Transaction(amount=40.0, DeviceInfo="SM-B Build/2", device_id="test:device:b"), history=hist)
     ch = state["card_history"]
     assert ch["prior_transaction_count"] == 3
     assert ch["transactions_last_24h"] == 2
     assert ch["amount_usd_last_24h"] == 80.0
     assert state["device"]["device_is_new_for_card"] is False
-    assert state["device"]["device_identifier_kind"] == "fingerprint"
+    assert state["device"]["device_identifier_kind"] == "device_id"
 
 
 def test_generic_device_string_is_not_a_fingerprint():
     at = datetime(2026, 1, 10, tzinfo=UTC)
     prior = [
-        PriorTxn(amount=25.0, timestamp=at - timedelta(days=3), device_info="Windows", outcome="approved"),
-        PriorTxn(amount=30.0, timestamp=at - timedelta(hours=1), device_info="Windows", outcome="approved"),
+        PriorTxn(amount=25.0, timestamp=at - timedelta(days=3), device_info="Windows"),
+        PriorTxn(amount=30.0, timestamp=at - timedelta(hours=1), device_info="Windows"),
     ]
     hist = compute_card_history_features(
         prior=prior, amount=40.0, at=at, device_info="Windows", email_domain="outlook.com"
@@ -144,7 +164,8 @@ def test_feature_store_history_for_seeded_card():
     tx = Transaction(
         amount=62.5,
         card_id="card_good_001",
-        DeviceInfo=DEMO_TRUSTED_DEVICE,
+        DeviceInfo="SM-G950F Build/R16NW",
+        device_id=DEMO_TRUSTED_DEVICE,
         P_emaildomain="gmail.com",
     )
     hist = store.history_features(tx)
@@ -154,9 +175,10 @@ def test_feature_store_history_for_seeded_card():
     assert hist["mean_amount_usd_prior"] == 62.5
     assert hist["trusted_device_ids"] == [DEMO_TRUSTED_DEVICE]
     assert hist["current_device_is_trusted"] is True
-    assert hist["confirmed_outcomes"] == {"approved": 12, "declined": 0, "chargeback": 0}
+    assert hist["confirmed_outcomes"] is None
+    assert hist["authorization_decisions"] == {"approved": 12, "declined": 0, "pending": 0}
     assert len(hist["recent_attempts"]) == 5
-    assert hist["recent_attempts"][0]["outcome"] == "approved"
+    assert hist["recent_attempts"][0]["authorization_decision"] == "approved"
     state = build_state(tx, history=hist)
     assert state["card_history"]["card_is_new"] is False
     assert state["card_history"]["mean_amount_usd_prior"] == 62.5
@@ -175,9 +197,10 @@ def test_windows_on_established_card_does_not_match_a_device():
     assert hist["device_seen_before_on_this_card"] is None
     assert hist["trusted_device_ids"] == []
     assert hist["current_device_is_trusted"] is None
-    assert hist["confirmed_outcomes"]["approved"] == 8
+    assert hist["confirmed_outcomes"] is None
+    assert hist["authorization_decisions"]["approved"] == 8
     assert hist["recent_attempts"]
-    assert store.device_history("Windows")["identifier_kind"] == "description"
+    assert store.device_history("Windows")["identifier_kind"] == "unknown"
     assert store.device_history("Windows")["distinct_cards_seen"] is None
     store.record(Transaction(amount=10, card_id="card_ato_002", DeviceInfo="Windows"), "approved")
     assert "Windows" not in store.device_index
@@ -194,6 +217,7 @@ def test_feature_store_new_card_and_shared_device():
         amount=1250,
         card_id="card_new_777",
         DeviceInfo="SM-G9650 Build/R16NW",
+        device_id=DEMO_SHARED_DEVICE,
     )
     hist = store.history_features(tx)
     assert hist["history_found"] is False
@@ -208,7 +232,7 @@ def test_feature_store_new_card_and_shared_device():
     assert state["device"]["device_distinct_cards_seen"] == 4
     assert state["card_history"]["trusted_device_ids"] == []
     assert state["card_history"]["recent_attempts"] == []
-    assert state["card_history"]["confirmed_outcomes"] == {"approved": 0, "declined": 0, "chargeback": 0}
+    assert state["card_history"]["confirmed_outcomes"] == {"legitimate": 0, "fraud": 0, "chargeback": 0}
 
 
 def test_card_present_rules_reach_jev_state():
@@ -266,28 +290,31 @@ def test_card_present_rules_reach_jev_state():
     assert "card_present" not in build_state(Transaction(amount=12.5, channel="card_not_present", merchant_id="m"))
 
 
-def test_hard_authorization_controls_decline_without_a_high_fraud_score():
-    from app.features.card_present import authorization_decline_reason
-
-    stolen = build_state(
-        Transaction(
-            amount=48,
-            channel="card_present",
-            card_status="stolen",
-            track_cvv="mismatch",
-            entry_mode="swipe",
-        )
+def test_hard_controls_decline_before_the_model_on_either_channel():
+    stolen = Transaction(
+        amount=48,
+        channel="card_present",
+        card_status="stolen",
+        track_cvv="mismatch",
+        entry_mode="swipe",
     )
-    reason = authorization_decline_reason(stolen)
+    reason = decline_before_model(stolen)
     assert reason is not None
     assert "card_unusable" in reason
     assert "track_cvv_mismatch" in reason
 
-    over = build_state(
-        Transaction(amount=80, channel="card_present", available_credit_usd=50, card_status="open")
-    )
-    assert "over_limit" in (authorization_decline_reason(over) or "")
-    assert authorization_decline_reason(build_state(Transaction(amount=40))) is None
+    not_present = Transaction(amount=48, channel="card_not_present", card_status="stolen")
+    assert "card_unusable" in (decline_before_model(not_present) or "")
+    assert "card_present" not in build_state(not_present)
+    assert build_state(not_present)["transaction"]["card_status"] == "stolen"
+
+    over = Transaction(amount=80, channel="card_present", available_credit_usd=50, card_status="open")
+    assert "over_limit" in (decline_before_model(over) or "")
+    cnp_over = Transaction(amount=80, channel="card_not_present", available_credit_usd=50, card_status="open")
+    assert "over_limit" in (decline_before_model(cnp_over) or "")
+    assert decline_before_model(Transaction(amount=40)) is None
+    with pytest.raises(ValidationError, match="track_cvv"):
+        Transaction(amount=40, channel="card_not_present", track_cvv="mismatch", card_status="open")
 
     probe = build_state(Transaction(amount=0.5, channel="card_present", card_status="open"), history={})
     assert probe["card_present"]["amount_usd"] == 0.5
@@ -299,7 +326,7 @@ def test_hard_authorization_controls_decline_without_a_high_fraud_score():
     )
     assert spike["card_present"]["rules"]["amount_far_above_history"] is True
     assert spike["card_present"]["rules"]["amount_far_above_this_merchant"] is True
-    assert authorization_decline_reason(spike) is None
+    assert decline_before_model(Transaction(amount=200, channel="card_present", card_status="open")) is None
 
 
 def test_merchant_country_change_within_2h():
@@ -315,18 +342,14 @@ def test_merchant_country_change_within_2h():
     ]
     from app.features.history import compute_merchant_features
 
-    feats = compute_merchant_features(
-        prior=prior, at=at, merchant_id="merch_elec_19", merchant_country="BR"
-    )
+    feats = compute_merchant_features(prior=prior, at=at, merchant_id="merch_elec_19", merchant_country="BR")
     assert feats["merchant_seen_before_on_this_card"] is False
     assert feats["distinct_merchants_last_1h"] == 2
     assert feats["previous_merchant_country"] == "US"
     assert feats["minutes_since_previous_merchant"] == 40.0
     assert feats["merchant_country_changed_within_2h"] is True
 
-    same = compute_merchant_features(
-        prior=prior, at=at, merchant_id="merch_grocery_88", merchant_country="US"
-    )
+    same = compute_merchant_features(prior=prior, at=at, merchant_id="merch_grocery_88", merchant_country="US")
     assert same["merchant_seen_before_on_this_card"] is True
     assert same["merchant_country_changed_within_2h"] is False
     assert same["distinct_merchants_last_1h"] == 1

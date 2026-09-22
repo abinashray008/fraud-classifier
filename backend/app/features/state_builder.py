@@ -15,6 +15,8 @@ This module therefore:
   and time windows in the field names (USD, days, 1h / 24h / 7d)
 - when the request is a card-present authorization, attaches that section
   (`card_present`) including the real-time rule facts
+- puts issuer card status on the transaction itself, so a card-not-present
+  request does not lose it by omitting the card-present section
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.features.card_present import build_card_present
-from app.features.history import device_identifier_kind, is_device_fingerprint
+from app.features.history import AUTHORIZATION_COUNTER_KEYS, device_identifier_kind
 from app.schemas.transaction import Transaction
 
 UNKNOWN = "unknown"
@@ -41,6 +43,7 @@ _DEVICE_EVIDENCE = frozenset(
 )
 _HISTORY_EVIDENCE = frozenset(
     {
+        *AUTHORIZATION_COUNTER_KEYS,
         "history_found",
         "prior_transaction_count",
         "card_is_new",
@@ -62,6 +65,7 @@ _HISTORY_EVIDENCE = frozenset(
         "trusted_device_ids",
         "recent_attempts",
         "confirmed_outcomes",
+        "authorization_decisions",
     }
 )
 
@@ -163,7 +167,7 @@ def _round(v: float | None, nd: int = 2) -> float | None:
 def _merge_history(tx: Transaction, history: dict[str, Any] | None) -> dict[str, Any]:
     """Use retrieved history as-is.
 
-    Caller-supplied averages and device lists apply only when no history dict
+    Caller-supplied averages apply only when no history dict
     was retrieved (unit tests and offline callers). A provided dict wins even
     when some values are missing — those stay unknown rather than being filled
     from the request.
@@ -173,9 +177,6 @@ def _merge_history(tx: Transaction, history: dict[str, Any] | None) -> dict[str,
     merged: dict[str, Any] = {}
     if tx.card_avg_amount and tx.card_avg_amount > 0:
         merged["mean_amount_usd_prior"] = tx.card_avg_amount
-    if is_device_fingerprint(tx.device_info) and tx.card_known_devices is not None:
-        fingerprints = [d for d in tx.card_known_devices if is_device_fingerprint(d)]
-        merged["device_seen_before_on_this_card"] = tx.device_info in fingerprints
     return merged
 
 
@@ -201,7 +202,7 @@ def build_state(tx: Transaction, history: dict[str, Any] | None = None) -> dict[
 
     prior_count = hist.get("prior_transaction_count")
     card_is_new = None if not isinstance(prior_count, int) or isinstance(prior_count, bool) else prior_count == 0
-    device_seen = hist.get("device_seen_before_on_this_card")
+    device_seen = hist.get("device_seen_before_on_this_card") if tx.device_id else None
 
     transaction: dict[str, Any] = {
         "amount_usd": _round(tx.amount),
@@ -210,6 +211,8 @@ def build_state(tx: Transaction, history: dict[str, Any] | None = None) -> dict[
         "is_night_time": (hour is not None and (hour < 6 or hour >= 23)) if hour is not None else None,
         "card_network": tx.card_network,
         "card_type": tx.card_type,
+        "channel": tx.channel,
+        "card_status": tx.card_status,
         "purchaser_email_domain": tx.purchaser_email_domain,
         "purchaser_email_domain_type": p_domain_type,
         "recipient_email_domain": tx.recipient_email_domain,
@@ -224,15 +227,17 @@ def build_state(tx: Transaction, history: dict[str, Any] | None = None) -> dict[
     device: dict[str, Any] = {
         "device_type": tx.device_type,
         "device_info": tx.device_info,
-        "device_identifier_kind": device_identifier_kind(tx.device_info),
+        "device_id": tx.device_id,
+        "device_identifier_kind": device_identifier_kind(tx.device_info, tx.device_id),
         "device_seen_before_on_this_card": device_seen if isinstance(device_seen, bool) else None,
         "device_is_new_for_card": None if not isinstance(device_seen, bool) else not device_seen,
-        "current_device_is_trusted": hist.get("current_device_is_trusted"),
-        "device_distinct_cards_seen": hist.get("device_distinct_cards_seen"),
-        "device_chargebacks": hist.get("device_chargebacks"),
+        "current_device_is_trusted": hist.get("current_device_is_trusted") if tx.device_id else None,
+        "device_distinct_cards_seen": hist.get("device_distinct_cards_seen") if tx.device_id else None,
+        "device_chargebacks": hist.get("device_chargebacks") if tx.device_id else None,
     }
 
     card_history: dict[str, Any] = {
+        **{key: hist.get(key) for key in AUTHORIZATION_COUNTER_KEYS},
         "history_found": hist.get("history_found"),
         "prior_transaction_count": prior_count,
         "card_is_new": card_is_new,
@@ -254,6 +259,7 @@ def build_state(tx: Transaction, history: dict[str, Any] | None = None) -> dict[
         "trusted_device_ids": hist.get("trusted_device_ids"),
         "recent_attempts": hist.get("recent_attempts"),
         "confirmed_outcomes": hist.get("confirmed_outcomes"),
+        "authorization_decisions": hist.get("authorization_decisions"),
     }
 
     state = {

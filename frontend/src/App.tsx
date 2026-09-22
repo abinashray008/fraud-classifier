@@ -92,7 +92,8 @@ export default function App() {
             <>
               <DecisionInspector score={score} record={record} />
               {score.decision === 'STEP_UP' && score.challenge_id && (
-                <OtpChallenge challengeId={score.challenge_id} devCode={score.dev_otp_code} onResult={onVerify} />
+                <OtpChallenge key={score.challenge_id} challengeId={score.challenge_id}
+                  devCode={score.dev_otp_code} onResult={onVerify} record={record} />
               )}
               {record && <InvestigationPanel inv={record.investigation} />}
             </>

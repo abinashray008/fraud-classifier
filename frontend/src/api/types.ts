@@ -16,6 +16,7 @@ export interface TransactionInput {
   timestamp_delta_seconds?: number
   device_type?: string
   device_info?: string
+  device_id?: string
   /** Opaque IEEE-CIS count/timedelta columns; accepted but not interpreted. */
   c1?: number
   c2?: number
@@ -81,10 +82,11 @@ export interface PolicyExplanation {
   rule: string
   t_low: number
   t_high: number
-  fraud_probability: number
-  risk_score: number
+  /** Absent when a hard control declined before the model was called. */
+  fraud_probability: number | null
+  risk_score: number | null
   /** Concentration of the risk-level distribution. Not P(the fraud answer is correct). */
-  risk_confidence: number
+  risk_confidence: number | null
   review_reason: 'contradictory' | 'insufficient_evidence' | 'ambiguous' | null
 }
 
@@ -116,7 +118,7 @@ export interface InvestigationRecord {
 export interface ScoreResponse {
   decision_id: string
   decision: DecisionOutcome
-  jev: JevAnswers
+  jev: JevAnswers | null
   explanation: PolicyExplanation
   challenge_id: string | null
   dev_otp_code: string | null
@@ -136,12 +138,13 @@ export interface DecisionRecord {
   created_at: string
   transaction: Record<string, unknown>
   state: Record<string, unknown>
-  jev: JevAnswers
+  jev: JevAnswers | null
   decision: DecisionOutcome
   explanation: PolicyExplanation
   challenge_id: string | null
   final_decision: DecisionOutcome | null
   final_reason: string | null
+  investigation_required: boolean
   investigation: InvestigationRecord
 }
 

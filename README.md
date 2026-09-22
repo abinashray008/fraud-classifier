@@ -12,6 +12,11 @@ POST /transactions/score
   StateBuilder  -> verified IEEE fields + card-history features; card_present rules on an in-person auth
         |
         v
+  Hard controls, before the model
+     issuer (either channel): unusable card, over credit limit -> DECLINE
+     card-present only: track CVV mismatch, PIN failure -> DECLINE
+        |
+        v
   Jev (one call, 7 questions in parallel)
      is_fraud: Noul     risk: Score(5 levels)     pattern: Choice(6)     4 signal Nouls
         |
@@ -160,8 +165,9 @@ Whether the old extra gate (`DECLINE` only when `risk.confidence` was also high)
 `policy/final.py` after OTP:
 
 - OTP failed / expired -> `DECLINE`
-- OTP verified -> `APPROVE`, unless the agent verdict has `fraud_prob >= POLICY_AGENT_DECLINE_PROB` -> `DECLINE`
-  (OTP can be intercepted in an account takeover; strong evidence wins)
+- OTP verified with a required investigation still running, failed, or missing a verdict -> pending (`final_decision: null`). Failure requires retry or manual review; it never silently approves.
+- OTP verified with a completed required investigation -> `DECLINE` when `fraud_prob >= POLICY_AGENT_DECLINE_PROB`, otherwise `APPROVE`.
+- When investigation is explicitly disabled, OTP verification can authorize `APPROVE`. It does not establish device ownership.
 - If the agent finishes after verification, the record is re-finalized; poll `GET /decisions/{id}`
 
 ## Investigation agent
@@ -185,21 +191,37 @@ The agent never runs on the request path and never runs for clear `APPROVE`/`DEC
 A swipe, chip insert, or tap at a merchant is an authorization request the acquirer
 sent through the card network for an approve or decline. Send `channel: "card_present"`
 with the terminal facts: `entry_mode` (`swipe`, `chip`, `contactless`, `fallback_swipe`,
-`keyed`), `card_status`, `cvm_result`, `pin_tries_exceeded`, `track_cvv`, merchant id /
-name / MCC / country / city, `cardholder_country`, and the credit limits.
+`keyed`), `cvm_result`, `pin_tries_exceeded`, `track_cvv`, merchant id / name / MCC /
+country / city, and `cardholder_country`. `card_status` and the credit limits are issuer
+facts: they apply on `card_not_present` as well. Combining terminal facts with
+`channel: "card_not_present"` is rejected.
 
-Jev receives those as a `card_present` section, including `rules` computed from the
-request and from this card's earlier merchants. `is_fraud`, `risk`, `pattern`, and the
-`presentment_invalid` and `merchant_anomaly` signals are instructed to judge from that
-section. Rows without those fields, including IEEE-CIS, omit it.
+Those terminal facts reach Jev as a `card_present` section, including `rules` computed
+from the request and from this card's earlier merchants. `is_fraud`, `risk`, `pattern`,
+and the `presentment_invalid` and `merchant_anomaly` signals are instructed to judge
+from that section. Rows without those fields, including IEEE-CIS, omit it. Issuer
+`card_status` is on the transaction itself, so an explicit card-not-present channel
+does not drop it.
 
-Four controls decline the network response on their own. A low `is_fraud` score does
-not approve them, and Jev still scores the same state:
+Hard controls are evaluated before the model call. A timeout cannot approve them, and
+the score response has no Jev answers when one fires:
 
-- `card_unusable` — lost, stolen, expired, or blocked
-- `track_cvv_mismatch` — magstripe CVV1/CVC1 does not match
-- `pin_failure` — PIN failed, or the PIN try limit is exceeded
-- `over_limit` — amount is above available credit or the single-purchase limit
+- `card_unusable` — lost, stolen, expired, or blocked (either channel)
+- `over_limit` — amount is above available credit or the single-purchase limit (either channel)
+- `track_cvv_mismatch` — magstripe CVV1/CVC1 does not match (card-present only)
+- `pin_failure` — PIN failed, or the PIN try limit is exceeded (card-present only)
+
+These controls determine authorization eligibility, not whether the genuine cardholder
+consented to the purchase. An expired card, a mistyped PIN, or insufficient credit can
+require declining a legitimate purchase. Fraud prompts and risk/pattern questions keep
+that distinction explicit. `presentment_invalid` describes a control or verification
+failure; it is not a fraud label, and fallback alone does not make it true.
+
+Chip-to-magstripe fallback can result from a damaged chip or terminal read problem,
+as described in the [U.S. Payments Forum fallback guidance](https://www.uspaymentsforum.org/emv-implementation-guidance-fallback-transactions/).
+The model treats fallback and failed verification as context, considers legitimate
+explanations, and requires corroboration before inferring unauthorized use. Fallback
+sets no minimum fraud-risk level.
 
 Jev also reads `card_present.amount_usd` against this card's prior mean
 (`amount_vs_mean_prior_ratio`) and against prior tickets at the same merchant.
@@ -256,7 +278,7 @@ apply those weights. Do not report those three numbers on an unweighted 30% frau
 
 1. Download `train_transaction.csv` and `train_identity.csv` from
    [Kaggle IEEE-CIS](https://www.kaggle.com/competitions/ieee-fraud-detection/data) into `data/ieee/`.
-2. Sample, score (answers are cached per `(model, transaction_id)` so sweeps are free), select thresholds on the calibration period, then report on the test period:
+2. Sample, score (answers are cached by input, questions, feature definitions, and resolved model so sweeps are free), select thresholds on the calibration period, then report on the test period:
 
 ```bash
 cd backend
@@ -268,6 +290,13 @@ cd backend
     --out eval/reports/reliability.svg
 .venv/bin/python -m eval.metrics   --answers eval/reports/answers_jev-1.13.0.parquet --t-low 0.2 --t-high 0.8
 ```
+
+Legacy answer caches without fingerprints are rescored automatically by `eval.run_eval`.
+Each output contains only the current sample and refreshes labels, splits, and weights from it.
+Pin a model version to reuse answers; aliases such as `jev-latest` are always rescored.
+Report commands reject missing, null, or unknown splits and transactions assigned to multiple
+splits. For legacy samples without splits, rerun `eval.load_ieee` and then `eval.run_eval`;
+do not assign old answers to calibration and test by hand.
 
 `calibrate` prints `POLICY_T_LOW` / `POLICY_T_HIGH` / `POLICY_EVIDENCE_MIN` for your constraints; paste them into `.env` together with the pinned `JEV_MODEL`. It will not use test rows. It also prints `confidence_gate`, the outcome delta of the historical `risk.confidence` decline gate.
 
@@ -307,3 +336,99 @@ All integration points are isolated in `jev/classifier.py` and `agent/guardrail.
 
 Persistence (in-memory store only), analyst review queue, LangSmith dashboards (tracing works out of the
 box if `LANGSMITH_TRACING=true` is set), real SMS provider.
+
+### Device identity provenance
+
+`DeviceInfo` / `device_info` always describes a device, OS, model or software build.
+It is never used to establish identity, even if the string looks specific or random.
+Android's [build fingerprint definition](https://source.android.com/docs/compatibility/12/android-12-cdd#3_2_2_build_parameters)
+identifies a software build, not an individual physical device.
+
+`device_id` is a separate, optional opaque key. A trusted server integration must
+supply it from a verified device-enrollment service (for example, an issuer registry
+that maps a verified device credential to a stable ID). Namespace IDs by issuer or
+provider to avoid collisions and keep them stable across cards and software updates.
+Never copy or hash DeviceInfo, a user agent, or a model/build string into this field.
+Omit it when provenance cannot be established. The demo accepts trusted caller input;
+it does not authenticate enrollment or make arbitrary client-supplied IDs trustworthy.
+A production gateway must discard end-user device_id claims and populate the field
+from its verified enrollment lookup.
+
+Only explicit IDs feed device reuse, trusted-device lists, cross-card sharing and
+chargeback lookups. Missing IDs leave identity evidence unknown; an exact distinct
+count is unknown when any transaction in its window lacks an ID. Empty windows have
+zero devices. Legacy `card_known_devices` descriptions no longer supply identity
+evidence. IEEE-CIS has no such device ID, so its build strings remain descriptive.
+The investigation tool `get_device_history` takes `device_id`; unrecorded IDs return
+unknown. Demo seeds and presets use synthetic `demo:device:*` IDs, independently of
+their display descriptions. Existing descriptions must never be backfilled as IDs.
+
+### Authorization history, ownership, and fraud outcomes
+
+Authorization decisions (`pending`, `approved`, `declined`) are policy actions.
+They appear under `authorization_decisions` and never populate `confirmed_outcomes`
+or establish device ownership. Each decision has one history row keyed by its
+`decision_id`; OTP retries and later decision updates modify that row without
+inflating transaction counts or velocity. Every card-identified attempt is recorded
+before waiting on the model or OTP provider, including pending step-ups and attempts
+whose processing later fails. The current attempt is excluded from its own scoring
+snapshot. Attempts without a card ID cannot be aggregated into per-card history.
+
+Live history exposes `attempts_last_{1h,24h,7d}`, `approvals_last_{1h,24h,7d}` and
+`confirmed_fraud_last_{1h,24h,7d}` separately. Existing `transactions_last_*` fields
+remain aliases for attempt counts; amount totals and repeated-amount checks also
+include pending and declined attempts. Investigation `velocity_stats` exposes the
+same separation with `*_in_window` keys. Windows use the original attempt time,
+so resolving an old OTP cannot move its attempt into a newer window. Approval
+counts reflect the current authorization decisions. Confirmed-fraud counts include
+only independently adjudicated `fraud` labels known at lookup time; a decline or
+chargeback alone does not establish fraud. Zero confirmed labels does not mean
+unlabeled attempts are legitimate. Offline IEEE-CIS evaluation has no authorization
+feed, so these additional live counters remain unknown there.
+
+Device trust comes only from the internal `FeatureStore.verify_device_ownership`
+method, called by a trusted enrollment/authentication adapter after verifying evidence
+bound to both the card and device. It requires a source, evidence reference, and
+verification time. `revoke_device_ownership` appends a revocation; later approvals
+cannot undo it. A new independent verification is required to restore trust. Ownership
+events are retained, and historical lookups honor their effective times. The seeded
+legitimate device has an explicit synthetic enrollment event. The demo OTP is not
+bound to device enrollment and never establishes trust.
+
+`record_verified_outcome` accepts independent adjudication or chargeback evidence
+with source, reference, and verification time. `confirmed_outcomes` contains only
+`legitimate`, `fraud`, and `chargeback` labels from this feed; it is unknown when no
+past transaction has a verified label. Corrections update the label and chargeback
+counts without adding transactions. Classifier and investigation predictions never
+call this method. These internal integration methods are not public HTTP endpoints
+or agent tools; production adapters must authenticate their evidence sources.
+
+Required investigations keep authorization pending until a completed verdict and
+successful OTP are both available. The console follows the stored decision as the
+investigation finishes. Failed investigations remain pending for retry/manual review;
+this demo does not provide a retry or manual-review endpoint.
+
+### Legitimate authorization-failure counterexamples
+
+`eval/fixtures/authorization_counterexamples.json` contains eight synthetic genuine
+purchases: a routine chip baseline, two technical fallback cases, an expired card,
+a mistyped PIN, exhausted PIN retries, a still-locked card, and insufficient credit.
+Each has a fraud label of zero and a separate expected hard-control decline flag.
+Explanations and labels are evaluation metadata and are excluded from model state.
+
+Run from `backend/` with the evaluation dependencies installed:
+
+```bash
+python -m eval.authorization_counterexamples --out eval/reports/authorization_counterexamples.parquet
+python -m eval.run_eval --sample eval/reports/authorization_counterexamples.parquet --out eval/reports/counterexamples_prompt_v2.parquet
+```
+
+The second command calls the configured Jev model. It intentionally scores even
+control-blocked inputs directly to check fraud semantics; live authorization still
+declines those cases before invoking the model. Inspect fraud probability, risk,
+pattern, and `presentment_invalid` independently of the expected issuer action.
+Compare routine chip and fallback cases for an unjustified risk floor. This small,
+all-legitimate stress set is not a calibration dataset or a prevalence estimate.
+Prompt and feature revisions automatically invalidate cached answers. Keep separate
+output files to compare revisions. Unit tests verify fixture plumbing
+and live control behavior with a fake classifier; they do not measure Jev's accuracy.

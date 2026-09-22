@@ -1,7 +1,7 @@
 """Score a labeled sample with Jev and cache per-row answers.
 
-Answers are cached to disk keyed by (model, transaction_id) so threshold sweeps and
-metric reports never re-spend tokens.
+Answers are cached by input, questions, feature definitions, and resolved model.
+Legacy caches are rebuilt; mutable model aliases are always rescored.
 
 Usage:
     TYPESAFE_API_KEY=... python -m eval.run_eval --sample eval/reports/sample.parquet \
@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -21,16 +23,36 @@ import pandas as pd
 from app.config import get_settings
 from app.features.state_builder import build_state
 from app.jev.classifier import JevFraudClassifier
-from app.jev.questions import SIGNAL_QUESTIONS
+from app.jev.questions import SIGNAL_QUESTIONS, build_questions
 from app.schemas.transaction import JevAnswers
 from eval.load_ieee import row_history, row_to_transaction
+
+CACHE_VERSION = 1
+
+
+def _fingerprint(value: object) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def feature_fingerprint() -> str:
+    """Invalidate results when feature computation, mapping, or schemas change."""
+    root = Path(__file__).resolve().parents[1]
+    paths = [root / "eval/load_ieee.py", root / "app/jev/classifier.py"]
+    for directory in ("app/features", "app/schemas"):
+        paths.extend(sorted((root / directory).glob("*.py")))
+    return _fingerprint({str(p.relative_to(root)): p.read_text() for p in paths})
+
+
+def _cache_key(provenance: dict, model: str) -> str:
+    return _fingerprint({**provenance, "resolved_model": model})
 
 
 def _cell(row: pd.Series, key: str):
     if key not in row.index:
         return None
     value = row[key]
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if value is None or pd.isna(value):
         return None
     return value
 
@@ -73,52 +95,93 @@ async def score_sample(
     concurrency: int,
     cache: pd.DataFrame | None,
 ) -> pd.DataFrame:
-    done = set()
-    if cache is not None and len(cache):
-        done = set(cache.loc[cache["model"] == classifier.model, "transaction_id"].astype(str))
-    todo = sample[~sample["TransactionID"].astype(str).isin(done)]
-    print(f"{len(done)} cached, {len(todo)} to score with {classifier.model}")
+    if concurrency < 1:
+        raise ValueError("concurrency must be positive")
+    if sample["TransactionID"].isna().any() or sample["TransactionID"].astype(str).duplicated().any():
+        raise ValueError("sample must have unique, non-null TransactionID values")
+    runnable = getattr(classifier, "runnable", None)
+    questions = runnable.questions if runnable is not None else build_questions()
+    context = {
+        "cache_version": CACHE_VERSION,
+        "questions_fingerprint": _fingerprint(
+            {name: q.model_dump(mode="json", exclude_none=True) for name, q in questions.items()}
+        ),
+        "features_fingerprint": feature_fingerprint(),
+    }
+    cached = {}
+    required = {*context, "input_fingerprint", "cache_key", "model", "transaction_id"}
+    # Only an explicitly pinned version can be resolved without a fresh request.
+    # A previous response cannot tell us what jev-latest resolves to today.
+    pinned = re.fullmatch(r"jev-\d+\.\d+\.\d+", classifier.model) is not None
+    if pinned and cache is not None and required <= set(cache.columns):
+        valid = cache[list(required)].notna().all(axis=1) & cache["model"].eq(classifier.model)
+        for name, value in context.items():
+            valid &= cache[name].eq(value)
+        for record in cache.loc[valid.fillna(False)].to_dict(orient="records"):
+            provenance = {**context, "input_fingerprint": record["input_fingerprint"]}
+            if record["cache_key"] == _cache_key(provenance, classifier.model):
+                cached[(str(record["transaction_id"]), record["cache_key"])] = record
 
     sem = asyncio.Semaphore(concurrency)
-    rows: list[dict] = []
+    rows: list[dict | None] = [None] * len(sample)
     errors = 0
+    hits = 0
+    scored = 0
+    print(f"checking {len(sample)} rows for compatible cached answers with {classifier.model}")
 
-    async def one(row: pd.Series) -> None:
-        nonlocal errors
+    async def one(index: int, row: pd.Series) -> None:
+        nonlocal errors, hits, scored
         tx = row_to_transaction(row)
         state = build_state(tx, history=row_history(row))
-        async with sem:
-            try:
-                answers = await classifier.classify(state)
-            except Exception as exc:  # noqa: BLE001
-                errors += 1
-                print(f"  ! {tx.transaction_id}: {type(exc).__name__}: {exc}")
-                return
+        # Include raw inputs as well as the exact state (which can round values).
+        # Reporting metadata is refreshed from the current sample on every hit.
+        inputs = row.drop(labels=["isFraud", "split", "sample_weight"], errors="ignore")
+        provenance = {
+            **context,
+            "input_fingerprint": _fingerprint(
+                {
+                    "input": json.loads(inputs.sort_index().to_json(date_format="iso", double_precision=15)),
+                    "state": state,
+                }
+            ),
+        }
+        key = _cache_key(provenance, classifier.model)
+        hit = cached.get((tx.transaction_id or "", key))
+        if hit is not None:
+            result = dict(hit)
+            hits += 1
+        else:
+            async with sem:
+                try:
+                    answers = await classifier.classify(state)
+                except Exception as exc:  # noqa: BLE001
+                    errors += 1
+                    print(f"  ! {tx.transaction_id}: {type(exc).__name__}: {exc}")
+                    return
+            result = answers_to_row(tx.transaction_id or "", int(row["isFraud"]), answers)
+            result.update(provenance)
+            result["cache_key"] = _cache_key(provenance, answers.model)
+            scored += 1
+            if scored % 100 == 0:
+                print(f"  scored {scored} rows")
+        result["requested_model"] = classifier.model
+        result["label"] = int(row["isFraud"])
+        result.pop("split", None)
+        result.pop("sample_weight", None)
         split = _cell(row, "split")
         weight = _cell(row, "sample_weight")
-        rows.append(
-            answers_to_row(
-                tx.transaction_id or "",
-                int(row["isFraud"]),
-                answers,
-                split=None if split is None else str(split),
-                sample_weight=None if weight is None else float(weight),
-            )
-        )
-        if len(rows) % 100 == 0:
-            print(f"  scored {len(rows)}/{len(todo)}")
+        if split is not None:
+            result["split"] = str(split)
+        if weight is not None:
+            result["sample_weight"] = float(weight)
+        rows[index] = result
 
     started = time.perf_counter()
-    await asyncio.gather(*(one(r) for _, r in todo.iterrows()))
+    await asyncio.gather(*(one(i, r) for i, (_, r) in enumerate(sample.iterrows())))
     elapsed = time.perf_counter() - started
-    print(f"scored {len(rows)} rows in {elapsed:.1f}s ({errors} errors)")
-
-    new = pd.DataFrame(rows)
-    if cache is not None and len(cache):
-        return pd.concat([cache, new], ignore_index=True).drop_duplicates(
-            subset=["model", "transaction_id"], keep="last"
-        )
-    return new
+    print(f"{hits} cached, scored {scored} rows in {elapsed:.1f}s ({errors} errors)")
+    # Never carry stale, failed, or out-of-sample rows into a report.
+    return pd.DataFrame([row for row in rows if row is not None])
 
 
 def main() -> None:
