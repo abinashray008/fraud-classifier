@@ -1,0 +1,91 @@
+{
+  "description": "Synthetic legitimate purchases with technical or authorization failures. Labels describe cardholder authorization, not issuer approval. Explanations are evaluation metadata and must not enter model state.",
+  "base_transaction": {
+    "amount": 52,
+    "card_id": "counterexample_card",
+    "channel": "card_present",
+    "entry_mode": "chip",
+    "card_status": "open",
+    "cvm_result": "pin_verified",
+    "track_cvv": "match",
+    "card_network": "visa",
+    "merchant_id": "routine_grocer",
+    "merchant_country": "US",
+    "cardholder_country": "US",
+    "mcc": "5411",
+    "available_credit_usd": 5000,
+    "single_purchase_limit_usd": 2000
+  },
+  "history": {
+    "history_found": true,
+    "prior_transaction_count": 24,
+    "days_since_first_transaction": 180,
+    "days_since_previous_transaction": 7,
+    "mean_amount_usd_prior": 50,
+    "transactions_last_1h": 0,
+    "transactions_last_24h": 0,
+    "transactions_last_7d": 1,
+    "amount_usd_last_1h": 0,
+    "amount_usd_last_24h": 0,
+    "amount_usd_last_7d": 50,
+    "matching_amount_count_last_24h": 0
+  },
+  "cases": [
+    {
+      "id": "legit_routine_chip",
+      "transaction": {},
+      "is_fraud": 0,
+      "expected_hard_decline": false,
+      "explanation": "Baseline genuine cardholder buying routine groceries."
+    },
+    {
+      "id": "legit_fallback_chip_read_error",
+      "transaction": {"entry_mode": "fallback_swipe"},
+      "is_fraud": 0,
+      "expected_hard_decline": false,
+      "explanation": "Same genuine purchase as baseline; a damaged chip causes fallback, with PIN verified and matching track CVV."
+    },
+    {
+      "id": "legit_fallback_terminal_error",
+      "transaction": {"entry_mode": "fallback_swipe", "cvm_result": "signature"},
+      "is_fraud": 0,
+      "expected_hard_decline": false,
+      "explanation": "Genuine cardholder, routine amount; terminal read failure followed by fallback with signature."
+    },
+    {
+      "id": "legit_expired_card",
+      "transaction": {"card_status": "expired"},
+      "is_fraud": 0,
+      "expected_hard_decline": true,
+      "explanation": "Genuine cardholder accidentally uses the expired card instead of its replacement; issuer must decline."
+    },
+    {
+      "id": "legit_mistyped_pin",
+      "transaction": {"cvm_result": "pin_failed"},
+      "is_fraud": 0,
+      "expected_hard_decline": true,
+      "explanation": "Genuine cardholder mistypes the PIN; failed verification requires decline but does not establish unauthorized use."
+    },
+    {
+      "id": "legit_pin_retry_limit",
+      "transaction": {"cvm_result": "pin_failed", "pin_tries_exceeded": true},
+      "is_fraud": 0,
+      "expected_hard_decline": true,
+      "explanation": "Genuine cardholder forgets the PIN and exhausts retries; issuer must decline."
+    },
+    {
+      "id": "legit_card_still_locked",
+      "transaction": {"card_status": "blocked"},
+      "is_fraud": 0,
+      "expected_hard_decline": true,
+      "explanation": "Genuine cardholder forgets to unlock their card before a routine purchase."
+    },
+    {
+      "id": "legit_credit_limit",
+      "transaction": {"available_credit_usd": 25},
+      "is_fraud": 0,
+      "expected_hard_decline": true,
+      "explanation": "Genuine cardholder lacks available credit for the routine purchase; this is an authorization decline."
+    }
+  ]
+}

@@ -25,10 +25,14 @@ class Settings(BaseSettings):
     jev_timeout_seconds: float = Field(default=5.0, alias="JEV_TIMEOUT_SECONDS")
     jev_max_retries: int = Field(default=1, alias="JEV_MAX_RETRIES")
 
-    # --- Decision policy (calibrate via backend/eval/calibrate.py) ------------
+    # --- Decision policy --------------------------------------------------------
+    # t_low / t_high are action thresholds from `python -m eval.calibrate`.
+    # That sweep does not calibrate is_fraud.noul; see `python -m eval.calibration`.
     policy_t_low: float = Field(default=0.20, alias="POLICY_T_LOW")
     policy_t_high: float = Field(default=0.80, alias="POLICY_T_HIGH")
-    policy_c_min: float = Field(default=0.60, alias="POLICY_C_MIN")
+    # Spread Score/Choice distributions below this go to review. This is not a
+    # decline authorizer and it is not P(the fraud answer is correct).
+    policy_evidence_min: float = Field(default=0.50, alias="POLICY_EVIDENCE_MIN")
     policy_agent_decline_prob: float = Field(default=0.90, alias="POLICY_AGENT_DECLINE_PROB")
 
     # --- OTP step-up ------------------------------------------------------------

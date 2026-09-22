@@ -73,7 +73,7 @@ def build_container(settings: Settings, classifier: FraudClassifier | None = Non
         thresholds=PolicyThresholds(
             t_low=settings.policy_t_low,
             t_high=settings.policy_t_high,
-            c_min=settings.policy_c_min,
+            evidence_min=settings.policy_evidence_min,
         ),
         feature_store=feature_store,
         investigator=investigator,

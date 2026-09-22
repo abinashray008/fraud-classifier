@@ -15,10 +15,23 @@ def make_answers(
     p_fraud: float,
     *,
     risk_conf: float = 0.9,
-    pattern: str = "legitimate",
+    pattern: str | None = None,
+    pattern_confidence: float = 0.95,
     risk_score: float | None = None,
+    signals: dict[str, float] | None = None,
 ) -> JevAnswers:
     score = risk_score if risk_score is not None else p_fraud * 4
+    if pattern is None:
+        if p_fraud > 0.8:
+            pattern = "stolen_card"
+        elif p_fraud < 0.2:
+            pattern = "legitimate"
+        else:
+            pattern = "other"
+    if signals is None:
+        signal_map = {"amount_anomalous": NoulResult(noul=p_fraud)}
+    else:
+        signal_map = {name: NoulResult(noul=value) for name, value in signals.items()}
     return JevAnswers(
         model="jev-test",
         is_fraud=NoulResult(noul=p_fraud),
@@ -28,8 +41,8 @@ def make_answers(
             probabilities={i: (1.0 if i == round(score) else 0.0) for i in range(len(RISK_LEVELS))},
             confidence=risk_conf,
         ),
-        pattern=ChoiceResult(choice=pattern, probabilities={pattern: 1.0}, confidence=0.95),
-        signals={"amount_anomalous": NoulResult(noul=p_fraud)},
+        pattern=ChoiceResult(choice=pattern, probabilities={pattern: 1.0}, confidence=pattern_confidence),
+        signals=signal_map,
         input_tokens=120,
         output_tokens=30,
         latency_ms=42.0,
@@ -57,7 +70,7 @@ def settings() -> Settings:
         TYPESAFE_API_KEY="test-key",
         POLICY_T_LOW=0.2,
         POLICY_T_HIGH=0.8,
-        POLICY_C_MIN=0.6,
+        POLICY_EVIDENCE_MIN=0.5,
         OTP_DEV_MODE=True,
         OTP_MAX_ATTEMPTS=3,
         AGENT_ENABLED=False,

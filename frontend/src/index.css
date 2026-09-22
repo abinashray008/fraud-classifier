@@ -105,7 +105,8 @@ button.link {
   padding: 0;
 }
 input,
-textarea {
+textarea,
+select {
   font: inherit;
   color: var(--text);
   background: var(--panel-2);
@@ -271,6 +272,25 @@ section {
 }
 .rule {
   font-size: 13px;
+}
+.amount-figure {
+  font-size: 28px;
+  font-weight: 650;
+  margin: 2px 0 6px;
+}
+.facts {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+.facts li {
+  margin: 2px 0;
+}
+.rule-flags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .pbar {

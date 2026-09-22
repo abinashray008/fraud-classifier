@@ -1,11 +1,8 @@
 """Merge the OTP outcome with the investigation verdict into a final decision.
 
-Rules (v1):
-- OTP failed or expired            -> DECLINE
-- OTP verified, no verdict yet     -> APPROVE (verdict recorded when it lands)
-- OTP verified, verdict fraud_prob >= agent_decline_prob -> DECLINE
-  (OTP can be intercepted in an account-takeover; strong agent evidence wins)
-- OTP verified otherwise           -> APPROVE
+OTP failure/expiry declines. OTP success stays pending until every required
+investigation completes with a verdict. Disabled investigation permits OTP-only
+authorization; failed/missing required investigation needs retry or manual review.
 """
 
 from __future__ import annotations
@@ -18,18 +15,22 @@ def finalize(
     verdict: Verdict | None,
     agent_decline_prob: float = 0.90,
     investigation_status: str = "running",
+    investigation_required: bool = True,
 ) -> tuple[DecisionOutcome | None, str | None]:
     if challenge_status == ChallengeStatus.PENDING:
         return None, None
     if challenge_status in (ChallengeStatus.FAILED, ChallengeStatus.EXPIRED):
         return DecisionOutcome.DECLINE, f"OTP {challenge_status.value.lower()}"
-    # VERIFIED
+    # VERIFIED: never return a provisional authorization as a final approval.
+    if investigation_required and (investigation_status != "completed" or verdict is None):
+        detail = (
+            "investigation failed; retry or manual review required"
+            if investigation_status == "failed"
+            else ("required investigation awaiting a completed verdict")
+        )
+        return None, f"OTP verified; {detail}"
     if verdict is None:
-        detail = {
-            "skipped": "investigation tier disabled",
-            "failed": "investigation failed; decided on OTP alone",
-        }.get(investigation_status, "investigation not yet complete")
-        return DecisionOutcome.APPROVE, f"OTP verified; {detail}"
+        return DecisionOutcome.APPROVE, "OTP verified; investigation tier disabled"
     if verdict.fraud_prob >= agent_decline_prob:
         return (
             DecisionOutcome.DECLINE,
